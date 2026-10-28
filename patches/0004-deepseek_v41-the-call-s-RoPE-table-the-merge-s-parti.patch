@@ -1,0 +1,1005 @@
+From b68a0281c8972f382028b2b5fcb10c8727b553f2 Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:03:19 +0700
+Subject: [PATCH 4/6] deepseek_v41: the call's RoPE table, the merge's partials
+ loaded early, one-barrier routing; logits bit-identical (decode 15.6 -> 15.15
+ ms). Checks: DS_SWEEP lat, replay, rx:, exp:, DS_REF
+
+---
+ zig/kernels/metal/deepseek/v41.metal          |  28 +-
+ zig/kernels/metal/deepseek/v41_attend.metal   |  58 +++--
+ zig/kernels/metal/deepseek/v41_moe.metal      |  96 ++++---
+ .../families/deepseek_v41_metal/forward.zig   | 186 ++++++++++++-
+ .../families/deepseek_v41_metal/kernels.zig   |  21 +-
+ zig/src/families/deepseek_v41_metal/state.zig |   6 +
+ zig/tests/dsv41_forward.zig                   | 244 +++++++++++++++++-
+ 7 files changed, 562 insertions(+), 77 deletions(-)
+
+diff --git a/zig/kernels/metal/deepseek/v41.metal b/zig/kernels/metal/deepseek/v41.metal
+index f5b82bb10..350be278c 100644
+--- a/zig/kernels/metal/deepseek/v41.metal
++++ b/zig/kernels/metal/deepseek/v41.metal
+@@ -444,19 +444,41 @@ struct RopeArgs {
+ };
+ 
+ // Adjacent pairs of a head's last 64 dims rotated by position * freq (torch.polar's complex product), bf16 out.
++// TAB: the (cos, sin) from the call's table (ds_rope_table) at FREQ's variant, the same floats as computed here.
++template <bool TAB>
+ [[kernel]] void ds_rope(device bfloat* X [[buffer(0)]], const device int* POS [[buffer(1)]],
+                         const device float* FREQ [[buffer(2)]], constant RopeArgs& a [[buffer(3)]],
+                         uint3 g [[thread_position_in_grid]]) {
+   const int i = int(g.x), h = int(g.y), r = int(g.z);
+   device bfloat* x = X + (size_t(r) * a.heads + h) * a.stride + a.offset + 2 * i;
+-  const float ang = float(POS[r]) * FREQ[i];
+-  const float cs = precise::cos(ang);
+-  const float sn = a.inverse ? -precise::sin(ang) : precise::sin(ang);
++  float cs, sn;
++  if (TAB) {
++    const float2 t = ((const device float2*)FREQ)[r * 32 + i];
++    cs = t.x;
++    sn = a.inverse ? -t.y : t.y;
++  } else {
++    const float ang = float(POS[r]) * FREQ[i];
++    cs = precise::cos(ang);
++    sn = a.inverse ? -precise::sin(ang) : precise::sin(ang);
++  }
+   const float re = float(x[0]), im = float(x[1]);
+   x[0] = bfloat(re * cs - im * sn);
+   x[1] = bfloat(re * sn + im * cs);
+ }
+ 
++template [[host_name("ds_rope")]] [[kernel]] decltype(ds_rope<false>) ds_rope<false>;
++template [[host_name("ds_rope_t")]] [[kernel]] decltype(ds_rope<true>) ds_rope<true>;
++
++// The call's RoPE table: (cos, sin) of POS[r] * freq[i] for both frequency variants, [variant][rows][32], once a
++// call, so the kernels that rotate by those positions read it instead of each computing it again.
++[[kernel]] void ds_rope_table(const device int* POS [[buffer(0)]], const device float* PLAIN [[buffer(1)]],
++                              const device float* COMPRESSED [[buffer(2)]], device float2* TAB [[buffer(3)]],
++                              constant int& rows [[buffer(4)]], uint3 g [[thread_position_in_grid]]) {
++  const int i = int(g.x), r = int(g.y), v = int(g.z);
++  const float ang = float(POS[r]) * (v ? COMPRESSED : PLAIN)[i];
++  TAB[(size_t(v) * rows + r) * 32 + i] = float2(precise::cos(ang), precise::sin(ang));
++}
++
+ // act_quant's fused quantize-dequantize: fp8 e4m3 with a power-of-two scale a block of 32, in place.
+ [[kernel]] void ds_fp8_qdq(device bfloat* X [[buffer(0)]], uint b [[thread_position_in_grid]]) {
+   device bfloat* x = X + size_t(b) * 32;
+diff --git a/zig/kernels/metal/deepseek/v41_attend.metal b/zig/kernels/metal/deepseek/v41_attend.metal
+index 3466419ed..979059bad 100644
+--- a/zig/kernels/metal/deepseek/v41_attend.metal
++++ b/zig/kernels/metal/deepseek/v41_attend.metal
+@@ -91,7 +91,17 @@ inline const device bfloat* attn_key(const device bfloat* RING, const device bfl
+ constant constexpr int SPLIT = 16;  // keys a split threadgroup takes (held in threadgroup memory: 16 KiB)
+ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgroup each), sharing its key tiles
+ 
++// A RoPE pair's (cos, sin) at row r's position and the i-th frequency: from the call's table (ds_rope_table, rows of
++// 32, bound at the table of FREQ's variant) with TAB, else computed here. The same floats either way.
++template <bool TAB>
++inline float2 rope_cs(const device float* FREQ, const device int* POS, int r, int i) {
++  if (TAB) return ((const device float2*)FREQ)[r * 32 + i];
++  const float ang = float(POS[r]) * FREQ[i];
++  return float2(precise::cos(ang), precise::sin(ang));
++}
++
+ // Decode rows' attention split by keys: a threadgroup a (HG heads, chunk, row), RoPE as queries load; partials out.
++template <bool TAB>
+ [[kernel]] void ds_attend_split(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
+                                 const device bfloat* COMP [[buffer(2)]], const device int* PICKS [[buffer(3)]],
+                                 device float* PO [[buffer(4)]], device float2* PML [[buffer(5)]],
+@@ -121,8 +131,8 @@ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgr
+   // the query's RoPE (its last 64 dims: lanes 28-31, pairs inside a lane), rounded to bf16 as ds_rope writes it
+   if (lane >= uint((HD - 64) / 16)) {
+     for (int p = 0; p < 8; p++) {
+-      const float ang = float(POS[r]) * FREQ[(int(lane) - (HD - 64) / 16) * 8 + p];
+-      const float cs = precise::cos(ang), sn = precise::sin(ang);
++      const float2 csn = rope_cs<TAB>(FREQ, POS, r, (int(lane) - (HD - 64) / 16) * 8 + p);
++      const float cs = csn.x, sn = csn.y;
+       const float re = q[2 * p], im = q[2 * p + 1];
+       q[2 * p] = float(bfloat(re * cs - im * sn));
+       q[2 * p + 1] = float(bfloat(re * sn + im * cs));
+@@ -162,18 +172,23 @@ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgr
+   if (lane == 0) PML[part] = float2(m, l);
+ }
+ 
++template [[host_name("ds_attend_split")]] [[kernel]] decltype(ds_attend_split<false>) ds_attend_split<false>;
++template [[host_name("ds_attend_split_t")]] [[kernel]] decltype(ds_attend_split<true>) ds_attend_split<true>;
++
+ // A (row, head)'s partials and sink as one softmax, then (as ds_rope inverse, ds_fp8_qdq) RoPE taken back, fp8-rounded.
+ struct MergeArgs {
+   int chunks;
+ };
+ 
+ // A head's 64 RoPE dims (the last of its 512) rotated, in a threadgroup's bf16 row, as ds_rope does (32 threads).
+-static void rope_row(threadgroup bfloat* x, int pos, const device float* FREQ, bool inverse, uint t) {
++template <bool TAB>
++static void rope_row(threadgroup bfloat* x, const device int* POS, int r, const device float* FREQ, bool inverse,
++                     uint t) {
+   if (t < 32) {
+     threadgroup bfloat* p = x + HD - 64 + 2 * int(t);
+-    const float ang = float(pos) * FREQ[t];
+-    const float cs = precise::cos(ang);
+-    const float sn = inverse ? -precise::sin(ang) : precise::sin(ang);
++    const float2 csn = rope_cs<TAB>(FREQ, POS, r, int(t));
++    const float cs = csn.x;
++    const float sn = inverse ? -csn.y : csn.y;
+     const float re = float(p[0]), im = float(p[1]);
+     p[0] = bfloat(re * cs - im * sn);
+     p[1] = bfloat(re * sn + im * cs);
+@@ -194,17 +209,22 @@ static void fp8_row(threadgroup bfloat* x, uint t, uint n) {
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+ }
+ 
++// Each thread's partials load before the softmax totals, so the loads overlap them; the sum keeps its chunk order.
++template <bool TAB>
+ [[kernel]] void ds_attend_merge(const device float* PO [[buffer(0)]], const device float2* PML [[buffer(1)]],
+                                 const device float* SINK [[buffer(2)]], device bfloat* O [[buffer(3)]],
+                                 constant MergeArgs& ma [[buffer(4)]], const device int* POS [[buffer(5)]],
+                                 const device float* FREQ [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                                 uint2 tpos [[thread_position_in_threadgroup]]) {
++  constexpr int MAXC = (128 + 512 + SPLIT - 1) / SPLIT;
+   const uint t = tpos.x;
+   const int h = int(tg.x), r = int(tg.y), chunks = ma.chunks;
+   threadgroup bfloat row[HD];
+-  threadgroup float scale[(128 + 512 + SPLIT - 1) / SPLIT];
+-  threadgroup float2 ml[(128 + 512 + SPLIT - 1) / SPLIT];
++  threadgroup float scale[MAXC];
++  threadgroup float2 ml[MAXC];
+   const size_t base = (size_t(r) * 64 + h) * chunks;
++  float pv[MAXC];
++  for (int c = 0; c < MAXC; c++) pv[c] = c < chunks ? PO[(base + c) * HD + t] : 0.0f;
+   for (int c = int(t); c < chunks; c += HD) ml[c] = PML[base + c];
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+   float m = SINK[h];
+@@ -213,18 +233,21 @@ static void fp8_row(threadgroup bfloat* x, uint t, uint n) {
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+   float denom = precise::exp(SINK[h] - m);
+   for (int c = 0; c < chunks; c++) denom += ml[c].y * scale[c];
+-  for (int d = int(t); d < HD; d += HD) {
+-    float acc = 0.0f;
+-    for (int c = 0; c < chunks; c++) acc += PO[(base + c) * HD + d] * scale[c];
+-    row[d] = bfloat(acc / denom);
+-  }
++  float acc = 0.0f;
++  for (int c = 0; c < MAXC; c++)
++    if (c < chunks) acc += pv[c] * scale[c];
++  row[t] = bfloat(acc / denom);
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+-  rope_row(row, POS[r], FREQ, true, t);
++  rope_row<TAB>(row, POS, r, FREQ, true, t);
+   fp8_row(row, t, HD);
+-  for (int d = int(t); d < HD; d += HD) O[(size_t(r) * 64 + h) * HD + d] = row[d];
++  O[(size_t(r) * 64 + h) * HD + t] = row[t];
+ }
+ 
++template [[host_name("ds_attend_merge")]] [[kernel]] decltype(ds_attend_merge<false>) ds_attend_merge<false>;
++template [[host_name("ds_attend_merge_t")]] [[kernel]] decltype(ds_attend_merge<true>) ds_attend_merge<true>;
++
+ // A window key's tail a threadgroup a row: ds_rms, ds_rope, ds_fp8_qdq in place, then into the ring (ring > 0).
++template <bool TAB>
+ [[kernel]] void ds_kv_finish(device bfloat* KV [[buffer(0)]], const device bfloat* W [[buffer(1)]],
+                              const device int* POS [[buffer(2)]], const device float* FREQ [[buffer(3)]],
+                              device bfloat* RING [[buffer(4)]], constant float2& a [[buffer(5)]],
+@@ -246,7 +269,7 @@ static void fp8_row(threadgroup bfloat* x, uint t, uint n) {
+   const float inv = precise::rsqrt(tot / float(HD) + a.x);
+   for (int i = int(t); i < HD; i += 256) row[i] = bfloat(float(W[i]) * (float(x[i]) * inv));
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+-  rope_row(row, POS[r], FREQ, false, t);
++  rope_row<TAB>(row, POS, int(r), FREQ, false, t);
+   fp8_row(row, t, 256);
+   const int ring = int(a.y);
+   device bfloat* dst = RING + size_t(ring > 0 ? POS[r] % ring : 0) * HD;
+@@ -255,3 +278,6 @@ static void fp8_row(threadgroup bfloat* x, uint t, uint n) {
+     if (ring > 0) dst[i] = row[i];
+   }
+ }
++
++template [[host_name("ds_kv_finish")]] [[kernel]] decltype(ds_kv_finish<false>) ds_kv_finish<false>;
++template [[host_name("ds_kv_finish_t")]] [[kernel]] decltype(ds_kv_finish<true>) ds_kv_finish<true>;
+diff --git a/zig/kernels/metal/deepseek/v41_moe.metal b/zig/kernels/metal/deepseek/v41_moe.metal
+index e76f882b7..b71430aa1 100644
+--- a/zig/kernels/metal/deepseek/v41_moe.metal
++++ b/zig/kernels/metal/deepseek/v41_moe.metal
+@@ -8,17 +8,21 @@ struct RouteArgs {
+   float scale;
+ };
+ 
++// The better of two (value, id) pairs in ds_route's order: the higher value, the lower id on ties.
++inline bool route_better(float ov, int oi, float v, int id) { return ov > v || (ov == v && oi < id); }
++
+ // Routing a threadgroup a row: top-k of sqrt(softplus) + bias (lower id on ties, bias_vl on images), expert order.
++// Each simdgroup takes its own top-k in that order without the threadgroup; simdgroup 0 then takes the top-k of
++// those candidates (nsg * topk <= 96), which are the row's in the same order, so the weights sum in pick order.
+ [[kernel]] void ds_route(const device float* LOGITS [[buffer(0)]], const device float* BIAS [[buffer(1)]],
+                          device uint* PICK [[buffer(2)]], device float* WEIGHT [[buffer(3)]],
+                          constant RouteArgs& a [[buffer(4)]], const device int* IMG [[buffer(5)]],
+                          const device float* BIAS_VL [[buffer(6)]], uint r [[threadgroup_position_in_grid]],
+                          uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+-  threadgroup float best_v[16];
+-  threadgroup int best_i[16];
+-  threadgroup int sel[16];
+-  threadgroup float w[16];
++  threadgroup float cv[32][16];
++  threadgroup int ci[32][16];
++  threadgroup float cs[32][16];
+   const device float* z = LOGITS + size_t(r) * a.experts;
+   float score = 0.0f, key = -INFINITY;
+   if (int(t) < a.experts) {
+@@ -26,49 +30,75 @@ struct RouteArgs {
+     score = precise::sqrt(x > 20.0f ? x : precise::log(1.0f + precise::exp(x)));
+     key = score + (IMG[r] ? BIAS_VL[t] : BIAS[t]);  // an image span's rows steer by their own bias
+   }
++  const int myid = int(t) < a.experts ? int(t) : 0x7fffffff;
+   for (int k = 0; k < a.topk; k++) {
+-    // the simdgroup's best (value, then lower id), then the threadgroup's
+     float v = key;
+-    int id = int(t) < a.experts ? int(t) : 0x7fffffff;
++    int id = myid;
+     for (ushort o = 16; o > 0; o >>= 1) {
+       const float ov = simd_shuffle_down(v, o);
+       const int oi = simd_shuffle_down(id, o);
+-      if (ov > v || (ov == v && oi < id)) {
++      if (route_better(ov, oi, v, id)) {
+         v = ov;
+         id = oi;
+       }
+     }
++    v = simd_broadcast(v, 0);
++    id = simd_broadcast(id, 0);
++    const float s = simd_broadcast(id == myid ? score : 0.0f, ushort(id & 31));
+     if (lane == 0) {
+-      best_v[sg] = v;
+-      best_i[sg] = id;
+-    }
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-    if (t == 0) {
+-      float bv = best_v[0];
+-      int bi = best_i[0];
+-      for (uint g = 1; g < nsg; g++)
+-        if (best_v[g] > bv || (best_v[g] == bv && best_i[g] < bi)) {
+-          bv = best_v[g];
+-          bi = best_i[g];
+-        }
+-      sel[k] = bi;
++      cv[sg][k] = v;
++      ci[sg][k] = id;
++      cs[sg][k] = s;
+     }
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-    if (int(t) == sel[k]) {
+-      w[k] = score;
+-      key = -INFINITY;
++    if (id == myid) key = -INFINITY;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (sg != 0) return;
++  // simdgroup 0: lane l holds candidates l, l + 32 and l + 64
++  const int total = int(nsg) * a.topk;
++  float lv[3], ls[3];
++  int li[3];
++  for (int j = 0; j < 3; j++) {
++    const int c = int(lane) + 32 * j;
++    const bool live = c < total;
++    lv[j] = live ? cv[c / a.topk][c % a.topk] : -INFINITY;
++    li[j] = live ? ci[c / a.topk][c % a.topk] : 0x7fffffff;
++    ls[j] = live ? cs[c / a.topk][c % a.topk] : 0.0f;
++  }
++  int s2[16];
++  float w2[16];
++  for (int k = 0; k < a.topk; k++) {
++    float v = lv[0];
++    int id = li[0];
++    for (int j = 1; j < 3; j++)
++      if (route_better(lv[j], li[j], v, id)) {
++        v = lv[j];
++        id = li[j];
++      }
++    for (ushort o = 16; o > 0; o >>= 1) {
++      const float ov = simd_shuffle_down(v, o);
++      const int oi = simd_shuffle_down(id, o);
++      if (route_better(ov, oi, v, id)) {
++        v = ov;
++        id = oi;
++      }
+     }
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
++    id = simd_broadcast(id, 0);
++    float mine = 0.0f;
++    bool has = false;
++    for (int j = 0; j < 3; j++)
++      if (li[j] == id) {
++        mine = ls[j];
++        has = true;
++        lv[j] = -INFINITY;
++        li[j] = 0x7fffffff;
++      }
++    s2[k] = id;
++    w2[k] = simd_broadcast(mine, ushort(simd_min(has ? lane : 32u)));
+   }
+-  if (t == 0) {
+-    int s2[16];
+-    float w2[16];
++  if (lane == 0) {
+     float sum = 0.0f;
+-    for (int k = 0; k < a.topk; k++) {
+-      s2[k] = sel[k];
+-      w2[k] = w[k];
+-      sum += w[k];
+-    }
++    for (int k = 0; k < a.topk; k++) sum += w2[k];
+     for (int k = 0; k < a.topk; k++) w2[k] = w2[k] / (sum + 1e-20f) * a.scale;
+     for (int i = 1; i < a.topk; i++)
+       for (int j = i; j > 0 && s2[j - 1] > s2[j]; j--) {
+diff --git a/zig/src/families/deepseek_v41_metal/forward.zig b/zig/src/families/deepseek_v41_metal/forward.zig
+index 43508839e..bb738edcd 100644
+--- a/zig/src/families/deepseek_v41_metal/forward.zig
++++ b/zig/src/families/deepseek_v41_metal/forward.zig
+@@ -81,12 +81,125 @@ fn note(comptime f: []const u8, a: anytype) void {
+ }
+ /// A projection's trace label, formatted only when a check reads it (trace, nobar_before).
+ fn labelled(comptime f: []const u8, a: anytype) []const u8 {
+-    if (!trace and nobar_before == null) return "";
++    if (!trace and nobar_before == null and lat == null) return "";
+     return std.fmt.bufPrint(&label, f, a) catch "";
+ }
+ var current: []const u8 = "";
+ var label: [64]u8 = undefined;
+ 
++/// A check's GPU time by dispatch group: each barrier ends the encoder and opens the next one (serial, timestamped at
++/// its start and end, fenced after the one before), so every group between two barriers gets its own GPU time.
++pub var lat: ?*Lat = null;
++pub const Lat = struct {
++    pub const max = 2048; // two samples a group; a sample buffer holds 4,096
++    pass: mtl.counters.ComputePass,
++    samples: mtl.counters.SampleBuffer,
++    fence: mtl.counters.Fence,
++    n: usize = 0,
++    names: [max][48]u8 = undefined,
++    lens: [max]u8 = undefined,
++
++    pub fn init(device: mtl.Device) !Lat {
++        return .{ .pass = try mtl.counters.ComputePass.init(), .samples = try mtl.counters.SampleBuffer.init(device, 2 * max), .fence = try mtl.counters.Fence.init(device) };
++    }
++    pub fn deinit(l: *Lat) void {
++        l.pass.deinit();
++        l.samples.deinit();
++        l.fence.deinit();
++    }
++    /// The group's name: its first dispatch's label.
++    pub fn name(l: *const Lat, i: usize) []const u8 {
++        return l.names[i][0..l.lens[i]];
++    }
++    fn cut(l: *Lat, x: Enc) void {
++        if (l.n >= max) return;
++        l.fence.update(x.ep.*);
++        x.ep.*.end();
++        const e = l.pass.compute(x.cbp.*, l.samples, 2 * l.n, 2 * l.n + 1) catch unreachable;
++        l.fence.waitCompute(e);
++        x.ep.* = e;
++        const len = @min(current.len, 48);
++        @memcpy(l.names[l.n][0..len], current[0..len]);
++        l.lens[l.n] = @intCast(len);
++        l.n += 1;
++    }
++};
++var opened = false;
++/// A check's stand-in kernel: dispatches of pipeline `key` run `pipe` instead (same bindings and grid).
++pub const Override = struct { key: []const u8, pipe: mtl.Pipeline };
++pub var override: ?Override = null;
++
++/// A check's record of one call's dispatches (the family's helpers' pipelines, bindings and grids), to replay each
++/// alone: its latency as a dependent step. Dispatches bound outside the helpers (the tiles, the tensor units) are
++/// left out.
++pub var rec: ?*Rec = null;
++pub const Rec = struct {
++    pub const max = 1600;
++    pub const Bind = struct { slot: u8, buf: ?Buffer = null, off: usize = 0, bytes: [64]u8 = undefined, len: u8 = 0 };
++    pub const Dispatch = struct {
++        pipe: mtl.Pipeline,
++        binds: [24]Bind = undefined,
++        nb: u8 = 0,
++        grid: [3]usize = .{ 0, 0, 0 },
++        group: [3]usize = .{ 0, 0, 0 },
++        by_threads: bool = false,
++        name: [48]u8 = undefined,
++        nlen: u8 = 0,
++        ok: bool = false,
++    };
++    items: [max]Dispatch = undefined,
++    n: usize = 0,
++    open: bool = false,
++
++    fn start(r: *Rec, p: mtl.Pipeline) void {
++        r.open = r.n < max;
++        if (!r.open) return;
++        r.items[r.n] = .{ .pipe = p };
++        const len = @min(current.len, 48);
++        @memcpy(r.items[r.n].name[0..len], current[0..len]);
++        r.items[r.n].nlen = @intCast(len);
++    }
++    fn bind(r: *Rec, b: Bind) void {
++        if (!r.open) return;
++        const d = &r.items[r.n];
++        if (d.nb == d.binds.len) {
++            r.open = false;
++            return;
++        }
++        d.binds[d.nb] = b;
++        d.nb += 1;
++    }
++    fn finish(r: *Rec, grid: [3]usize, group: [3]usize, by_threads: bool) void {
++        if (!r.open) return;
++        const d = &r.items[r.n];
++        d.grid = grid;
++        d.group = group;
++        d.by_threads = by_threads;
++        d.ok = true;
++        r.n += 1;
++        r.open = false;
++    }
++    pub fn name(r: *const Rec, i: usize) []const u8 {
++        return r.items[i].name[0..r.items[i].nlen];
++    }
++    /// Encodes dispatch i (its pipeline, bindings, grid) into `e`.
++    pub fn encode(r: *const Rec, i: usize, e: mtl.ComputeEncoder) void {
++        const d = &r.items[i];
++        e.setPipeline(d.pipe);
++        for (d.binds[0..d.nb]) |b| {
++            if (b.buf) |buf| e.setBuffer(buf, b.off, b.slot) else e.setBytes(b.bytes[0..b.len], b.slot);
++        }
++        if (d.by_threads) e.dispatchThreads(mtl.Size.of(d.grid[0], d.grid[1], d.grid[2]), mtl.Size.of(d.group[0], d.group[1], d.group[2])) else e.dispatchGroups(mtl.Size.of(d.grid[0], d.grid[1], d.grid[2]), mtl.Size.of(d.group[0], d.group[1], d.group[2]));
++    }
++};
++fn recBytes(slot: usize, bytes: []const u8) void {
++    const r = rec orelse return;
++    var b: Rec.Bind = .{ .slot = @intCast(slot), .len = @intCast(@min(bytes.len, 64)) };
++    if (bytes.len > 64) r.open = false;
++    @memcpy(b.bytes[0..b.len], bytes[0..b.len]);
++    r.bind(b);
++}
++
+ /// Whether DS_SKIP names `key`: a comma-separated list, or "!a,b" for everything but those.
+ fn skips(key: []const u8) bool {
+     const k = skip orelse return false;
+@@ -132,7 +245,7 @@ pub const Enc = struct {
+ 
+     /// `b` bound at this view's first row, `row_bytes` a row.
+     pub fn at(self: Enc, b: Buffer, row_bytes: usize, slot: usize) void {
+-        self.ep.*.setBuffer(b, self.r0 * row_bytes, slot);
++        self.buf(b, self.r0 * row_bytes, slot);
+     }
+ 
+     /// The tensor-unit pipelines for `w` when this call is a lone stream's prompt chunk.
+@@ -161,6 +274,11 @@ pub const Enc = struct {
+         }
+         counted[1] += 1;
+         note("\n| ", .{});
++        if (lat) |l| {
++            if (!opened) l.cut(self); // a dispatch whose state was bound before its fence (the tiles)
++            opened = false;
++            return;
++        }
+         if (!no_barriers and !serial and !dropped()) self.ep.*.barrier();
+     }
+     /// A left-out dispatch (DS_SKIP) still takes a `with` meant for it, so the next one keeps its barrier.
+@@ -172,11 +290,21 @@ pub const Enc = struct {
+         _ = self;
+         joined = true;
+     }
++    /// Lat: a dispatch about to bind its state opens its group's encoder first (a new encoder starts with none bound).
++    fn begin(self: Enc) void {
++        const l = lat orelse return;
++        if (joined) return;
++        l.cut(self);
++        opened = true;
++    }
+ 
+     pub fn pipe(self: Enc, comptime key: []const u8) void {
+         skipping = skips(key);
+         current = key;
+-        self.ep.*.setPipeline(self.m.kernels.get(key));
++        self.begin();
++        const p = if (override) |o| (if (std.mem.eql(u8, o.key, key)) o.pipe else self.m.kernels.get(key)) else self.m.kernels.get(key);
++        self.ep.*.setPipeline(p);
++        if (rec) |r| r.start(p);
+     }
+     /// DS_SKIP for a pipeline set by hand (the tensor-unit ones outside `names`).
+     pub fn skipAs(self: Enc, key: []const u8) void {
+@@ -185,12 +313,15 @@ pub const Enc = struct {
+     }
+     pub fn buf(self: Enc, b: Buffer, off: usize, slot: usize) void {
+         self.ep.*.setBuffer(b, off, slot);
++        if (rec) |r| r.bind(.{ .slot = @intCast(slot), .buf = b, .off = off });
+     }
+     pub fn tensor(self: Enc, t: wts.Tensor, slot: usize) void {
+         self.ep.*.setBuffer(t.buffer, t.offset, slot);
++        if (rec) |r| r.bind(.{ .slot = @intCast(slot), .buf = t.buffer, .off = t.offset });
+     }
+     pub fn args(self: Enc, v: anytype, slot: usize) void {
+         self.ep.*.setBytes(std.mem.asBytes(&v), slot);
++        recBytes(slot, std.mem.asBytes(&v));
+     }
+     pub fn threads(self: Enc, grid: [3]usize, group: [3]usize) void {
+         if (skipped()) return;
+@@ -198,6 +329,7 @@ pub const Enc = struct {
+         counted[0] += 1;
+         note("{s} ", .{current});
+         self.ep.*.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
++        if (rec) |r| r.finish(grid, group, true);
+     }
+     pub fn groups(self: Enc, grid: [3]usize, group: [3]usize) void {
+         if (skipped()) return;
+@@ -205,6 +337,7 @@ pub const Enc = struct {
+         counted[0] += 1;
+         note("{s} ", .{current});
+         self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
++        if (rec) |r| r.finish(grid, group, false);
+     }
+ 
+     /// y[rows, n] = x[rows, k] W^T: the tensor units for a prompt chunk's rows, else the row kernels.
+@@ -231,18 +364,21 @@ pub const Enc = struct {
+                 self.fence();
+                 counted[0] += 1;
+                 note("{s} ", .{current});
++                if (rec) |r| r.open = false;
+                 row.simd_bits.encode(self.ep.*, call, m, x, x_off, y, y_off);
+                 return;
+             } else |_| {}
+         };
+         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
+         current = labelled("row[{d}x{d}:{d}b]", .{ w.n, w.k, w.bits });
++        self.begin();
+         self.ep.*.setPipeline(call.pipeline);
++        if (rec) |r| r.start(call.pipeline);
+         self.buf(x, x_off, 0);
+         self.buf(w.w, w.w_off, 1);
+         self.buf(w.scales, w.s_off, 2);
+         self.buf(w.biases, w.b_off, 3);
+-        self.ep.*.setBytes(std.mem.asBytes(&call.dims), 4);
++        self.args(call.dims, 4);
+         self.buf(y, y_off, 5);
+         self.threads(.{ call.groups * call.threads, 1, 1 }, .{ call.threads, 1, 1 });
+     }
+@@ -253,12 +389,14 @@ pub const Enc = struct {
+         if (skipped()) return;
+         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
+         current = labelled("indexed[{d}x{d}:{d}b]", .{ x.one.n, x.one.k, x.one.bits });
++        self.begin();
+         self.ep.*.setPipeline(call.pipeline);
++        if (rec) |r| r.start(call.pipeline);
+         self.buf(in, 0, 0);
+         self.buf(x.one.w, x.one.w_off, 1);
+         self.buf(x.one.scales, x.one.s_off, 2);
+         self.buf(x.one.biases, x.one.b_off, 3);
+-        self.ep.*.setBytes(std.mem.asBytes(&call.dims), 4);
++        self.args(call.dims, 4);
+         self.buf(out, 0, 5);
+         self.buf(ids, 0, 6);
+         self.threads(.{ call.groups * call.threads, call.slots, 1 }, .{ call.threads, 1, 1 });
+@@ -295,6 +433,14 @@ pub const Enc = struct {
+         self.groups(.{ (n + 7) / 8, (rows + 7) / 8, 1 }, .{ 256, 1, 1 });
+     }
+ 
++    /// The call's RoPE table (s.trig) for rotations at `positions` = s.pos by `freq`, at this view's rows; null when
++    /// the call made none (the kernels compute their own).
++    fn trig(self: Enc, freq: Buffer, positions: Buffer) ?Ref {
++        const s = self.s;
++        if (s.trig_rows == 0 or positions.id != s.pos.id) return null;
++        const variant: usize = if (freq.id == self.m.freq_compressed.id) 1 else if (freq.id == self.m.freq_plain.id) 0 else return null;
++        return .{ .buf = s.trig, .off = (variant * s.trig_rows + self.r0) * 32 * 8 };
++    }
+     /// Attention over rows' windows and `picks` compressed keys (RoPE in and out, fp8): split by keys, or by row.
+     pub fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32, freq: Buffer) void {
+         const s = self.s;
+@@ -320,7 +466,8 @@ pub const Enc = struct {
+             return;
+         }
+         const chunks: usize = (c.window + picks + 15) / 16;
+-        self.pipe("ds_attend_split");
++        const tb = self.trig(freq, s.pos);
++        if (tb != null) self.pipe("ds_attend_split_t") else self.pipe("ds_attend_split");
+         self.at(q, qo, 0);
+         self.buf(ring, 0, 1);
+         self.buf(comp, 0, 2);
+@@ -329,16 +476,16 @@ pub const Enc = struct {
+         self.buf(s.attn_ml, 0, 5);
+         self.args(aa, 6);
+         self.at(s.pos, 4, 7);
+-        self.buf(freq, 0, 8);
++        if (tb) |t| self.buf(t.buf, t.off, 8) else self.buf(freq, 0, 8);
+         self.groups(.{ c.heads / split_heads, chunks, self.rows }, .{ split_heads * 32, 1, 1 });
+-        self.pipe("ds_attend_merge");
++        if (tb != null) self.pipe("ds_attend_merge_t") else self.pipe("ds_attend_merge");
+         self.buf(s.attn_po, 0, 0);
+         self.buf(s.attn_ml, 0, 1);
+         self.tensor(sink, 2);
+         self.at(o, qo, 3);
+         self.args(@as(i32, @intCast(chunks)), 4);
+         self.at(s.pos, 4, 5);
+-        self.buf(freq, 0, 6);
++        if (tb) |t| self.buf(t.buf, t.off, 6) else self.buf(freq, 0, 6);
+         self.groups(.{ c.heads, self.rows, 1 }, .{ c.head_dim, 1, 1 });
+     }
+ 
+@@ -352,10 +499,11 @@ pub const Enc = struct {
+     }
+ 
+     pub fn rope(self: Enc, x: Buffer, rows: usize, heads: usize, stride: usize, positions: Buffer, freq: Buffer, inverse: bool) void {
+-        self.pipe("ds_rope");
++        const tb = self.trig(freq, positions);
++        if (tb != null) self.pipe("ds_rope_t") else self.pipe("ds_rope");
+         self.at(x, heads * stride * 2, 0);
+         self.at(positions, 4, 1);
+-        self.buf(freq, 0, 2);
++        if (tb) |t| self.buf(t.buf, t.off, 2) else self.buf(freq, 0, 2);
+         self.args(RopeArgs{ .heads = @intCast(heads), .stride = @intCast(stride), .offset = @intCast(stride - c.rope_dim), .inverse = @intFromBool(inverse) }, 3);
+         self.threads(.{ c.rope_dim / 2, heads, rows }, .{ c.rope_dim / 2, 1, 1 });
+     }
+@@ -375,11 +523,12 @@ pub const Enc = struct {
+ 
+     /// The window keys' tail in place (kv_norm, RoPE, fp8), then into `ring` at their positions when given.
+     pub fn kvFinish(self: Enc, kv: Buffer, norm: wts.Tensor, freq: Buffer, ring: ?Buffer) void {
+-        self.pipe("ds_kv_finish");
++        const tb = self.trig(freq, self.s.pos);
++        if (tb != null) self.pipe("ds_kv_finish_t") else self.pipe("ds_kv_finish");
+         self.at(kv, c.head_dim * 2, 0);
+         self.tensor(norm, 1);
+         self.at(self.s.pos, 4, 2);
+-        self.buf(freq, 0, 3);
++        if (tb) |t| self.buf(t.buf, t.off, 3) else self.buf(freq, 0, 3);
+         if (ring) |r| self.buf(r, 0, 4) else self.at(kv, c.head_dim * 2, 4);
+         self.args([2]f32{ c.norm_eps, if (ring != null) @floatFromInt(st.ring) else 0 }, 5);
+         self.groups(.{ self.rows, 1, 1 }, .{ 256, 1, 1 });
+@@ -563,6 +712,17 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+     x.tensor(w.embed, 1);
+     x.buf(s.x, 0, 2);
+     x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
++    // the call's RoPE (cos, sin) at s.pos, beside the embedding: the kernels that rotate by s.pos read it (trig)
++    x.with();
++    x.pipe("ds_rope_table");
++    x.buf(s.pos, 0, 0);
++    x.buf(m.freq_plain, 0, 1);
++    x.buf(m.freq_compressed, 0, 2);
++    x.buf(s.trig, 0, 3);
++    x.args(@as(i32, @intCast(rows)), 4);
++    x.threads(.{ 32, rows, 2 }, .{ 32, 1, 1 });
++    s.trig_rows = rows;
++    defer s.trig_rows = 0;
+     if (images) {
+         const v = &(m.vision orelse return error.NoVisionTower);
+         x.pipe("ds_put_image");
+diff --git a/zig/src/families/deepseek_v41_metal/kernels.zig b/zig/src/families/deepseek_v41_metal/kernels.zig
+index 8a4606385..447f41d27 100644
+--- a/zig/src/families/deepseek_v41_metal/kernels.zig
++++ b/zig/src/families/deepseek_v41_metal/kernels.zig
+@@ -8,16 +8,17 @@ const frags = @import("../../core/frags.zig");
+ const cfg = @import("config.zig");
+ 
+ pub const names = [_][:0]const u8{
+-    "ds_embed",             "ds_hc_expand",    "ds_hc_boundary",   "ds_hc_collapse",      "ds_rms",
+-    "ds_gemv_bf_bf",        "ds_gemv_bf_f32",  "ds_rope",          "ds_fp8_qdq",          "ds_fp4_qdq",
+-    "ds_put_rows",          "ds_put_rows_f32", "ds_pool2",         "ds_index_scores_1x8", "ds_index_scores_2x16",
+-    "ds_index_scores_kept", "ds_kept_keys",    "ds_block_max",     "ds_topk",             "ds_topk_bf",
+-    "ds_route",             "ds_swiglu",       "ds_engram",        "ds_scale",            "ds_hc_mix_part",
+-    "ds_sort_count",        "ds_sort_scan",    "ds_attend_rows",   "ds_stream_mean",      "ds_markov",
+-    "ds_markov_pick",       "ds_linear_bias",  "ds_bias",          "ds_add",              "ds_vit_rope",
+-    "ds_vit_attend",        "ds_vit_glu",      "ds_unfold",        "ds_put_image",        "ds_attend_split",
+-    "ds_attend_merge",      "ds_kv_finish",    "ds_hc_expand_mix", "ds_sort_place",       "ds_hc_expand_mix_rows",
+-    "ds_gemv_cols_bf_f32",
++    "ds_embed",             "ds_hc_expand",      "ds_hc_boundary",    "ds_hc_collapse",      "ds_rms",
++    "ds_gemv_bf_bf",        "ds_gemv_bf_f32",    "ds_rope",           "ds_fp8_qdq",          "ds_fp4_qdq",
++    "ds_put_rows",          "ds_put_rows_f32",   "ds_pool2",          "ds_index_scores_1x8", "ds_index_scores_2x16",
++    "ds_index_scores_kept", "ds_kept_keys",      "ds_block_max",      "ds_topk",             "ds_topk_bf",
++    "ds_route",             "ds_swiglu",         "ds_engram",         "ds_scale",            "ds_hc_mix_part",
++    "ds_sort_count",        "ds_sort_scan",      "ds_attend_rows",    "ds_stream_mean",      "ds_markov",
++    "ds_markov_pick",       "ds_linear_bias",    "ds_bias",           "ds_add",              "ds_vit_rope",
++    "ds_vit_attend",        "ds_vit_glu",        "ds_unfold",         "ds_put_image",        "ds_attend_split",
++    "ds_attend_merge",      "ds_kv_finish",      "ds_hc_expand_mix",  "ds_sort_place",       "ds_hc_expand_mix_rows",
++    "ds_gemv_cols_bf_f32",  "ds_attend_split_t", "ds_attend_merge_t", "ds_kv_finish_t",      "ds_rope_t",
++    "ds_rope_table",
+ };
+ 
+ /// A prompt chunk's routed experts in int8 (x a 32 columns and the codes as int8, int32 sums); set before loading.
+diff --git a/zig/src/families/deepseek_v41_metal/state.zig b/zig/src/families/deepseek_v41_metal/state.zig
+index 3ad903d98..978087c10 100644
+--- a/zig/src/families/deepseek_v41_metal/state.zig
++++ b/zig/src/families/deepseek_v41_metal/state.zig
+@@ -114,6 +114,10 @@ pub const Scratch = struct {
+     post: mtl.Buffer,
+     comb: mtl.Buffer,
+     hc_part: mtl.Buffer, // f32 [rows, 20 slices, 25]: a boundary's partial mix sums
++    /// float2 [2 variants (plain, compressed), trig_rows, 32]: the call's RoPE (cos, sin) at its rows' positions
++    trig: mtl.Buffer,
++    /// The rows the table holds this call (forward.runSegs); 0: none, the kernels compute their own.
++    trig_rows: usize = 0,
+     qr: mtl.Buffer,
+     q: mtl.Buffer,
+     kv: mtl.Buffer,
+@@ -203,6 +207,8 @@ pub const Scratch = struct {
+         out.post = try m.alloc(rows * c.hc * 4);
+         out.comb = try m.alloc(rows * c.hc * c.hc * 4);
+         out.hc_part = try m.alloc(rows * (c.hc * c.hidden / 1024) * (c.hc_mix + 1) * 4);
++        out.trig = try m.alloc(2 * rows * 32 * 8);
++        out.trig_rows = 0;
+         out.qr = try m.alloc(rows * c.q_rank * 2);
+         out.q = try m.alloc(rows * c.heads * c.head_dim * 2);
+         out.kv = try m.alloc(rows * c.head_dim * 2);
+diff --git a/zig/tests/dsv41_forward.zig b/zig/tests/dsv41_forward.zig
+index 9bde2a907..e0d47ae1c 100644
+--- a/zig/tests/dsv41_forward.zig
++++ b/zig/tests/dsv41_forward.zig
+@@ -271,14 +271,31 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+             std.debug.print("\n", .{});
+             continue;
+         }
++        if (std.mem.eql(u8, key, "lat")) {
++            cache.len = base;
++            try latency(gpa, m, &scratch, &cache, token);
++            continue;
++        }
+         if (std.mem.eql(u8, key, "kbench")) {
+             try kbench(m, &scratch);
+             continue;
+         }
++        if (std.mem.eql(u8, key, "replay")) {
++            cache.len = base;
++            try replay(gpa, m, &scratch, &cache, token);
++            continue;
++        }
++        if (std.mem.startsWith(u8, key, "rx:")) {
++            cache.len = base;
++            try replayVariants(gpa, io, m, &scratch, &cache, token, key[3..]);
++            continue;
++        }
+         q.forward.no_barriers = std.mem.eql(u8, key, "nobar");
+         q.forward.serial = std.mem.eql(u8, key, "serial");
+         q.forward.nobar_before = if (std.mem.startsWith(u8, key, "nb:")) key[3..] else null;
+-        q.forward.skip = if (key.len == 0 or q.forward.no_barriers or q.forward.serial or q.forward.nobar_before != null) null else key;
++        const exp = std.mem.startsWith(u8, key, "exp:");
++        q.forward.override = if (exp) try overrideOf(gpa, io, m, key[4..]) else null;
++        q.forward.skip = if (key.len == 0 or exp or q.forward.no_barriers or q.forward.serial or q.forward.nobar_before != null) null else key;
+         for (0..4) |_| {
+             cache.len = base;
+             try q.forward.run(m, &scratch, &cache, &.{token}, .last, null);
+@@ -298,7 +315,21 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+             sum += s;
+         }
+         const row = cache.logits.slice(u16, c.vocab);
+-        if (key.len == 0) @memcpy(plain, row);
++        if (key.len == 0) {
++            @memcpy(plain, row);
++            // DS_REF: the plain row's logits against another build's (written there when the file is missing)
++            if (std.c.getenv("DS_REF")) |p| {
++                const path = std.mem.span(p);
++                const bytes = std.mem.sliceAsBytes(plain);
++                if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22))) |ref| {
++                    defer gpa.free(ref);
++                    std.debug.print("sweep reference {s}: logits {s}\n", .{ path, if (std.mem.eql(u8, ref, bytes)) "equal" else "DIFFER" });
++                } else |_| {
++                    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
++                    std.debug.print("sweep reference {s}: written\n", .{path});
++                }
++            }
++        }
+         const equal = std.mem.eql(u16, plain, row);
+         const mean = sum * 1e3 / reps;
+         if (key.len == 0) baseline = mean;
+@@ -308,6 +339,215 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+     q.forward.serial = false;
+     q.forward.skip = null;
+     q.forward.nobar_before = null;
++    q.forward.override = null;
++}
++
++var exp_lib: ?mtl.Library = null;
++
++/// The family's kernels with DS_EXP's file (experimental variants) appended, compiled once.
++fn expLibrary(gpa: std.mem.Allocator, io: std.Io, m: *q.Model) !mtl.Library {
++    if (exp_lib) |l| return l;
++    const path = std.mem.span(std.c.getenv("DS_EXP") orelse return error.SetDsExp);
++    const extra = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++    defer gpa.free(extra);
++    const src = try std.mem.concat(gpa, u8, &.{ @import("kernel_sources").deepseek_v41, "\n", extra });
++    defer gpa.free(src);
++    exp_lib = try mtl.Library.fromSource(m.device, src, mtl.CompileOptions.mlx());
++    return exp_lib.?;
++}
++
++/// "NAME=VAR": pipeline NAME's dispatches run DS_EXP's kernel VAR.
++fn overrideOf(gpa: std.mem.Allocator, io: std.Io, m: *q.Model, spec: []const u8) !q.forward.Override {
++    const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return error.BadExp;
++    const lib = try expLibrary(gpa, io, m);
++    return .{ .key = spec[0..eq], .pipe = try mtl.Pipeline.init(m.device, lib, spec[eq + 1 ..], false) };
++}
++
++/// "NAME=VAR1+VAR2": one decode row recorded, then each dispatch of pipeline NAME alone (40 times behind barriers)
++/// with its own kernel and with each variant: µs a dispatch, averaged over the call's dispatches of NAME.
++fn replayVariants(gpa: std.mem.Allocator, io: std.Io, m: *q.Model, s: *q.state.Scratch, cache: *q.state.Cache, token: u32, spec: []const u8) !void {
++    const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return error.BadExp;
++    const name = spec[0..eq];
++    const lib = try expLibrary(gpa, io, m);
++    const r = try gpa.create(q.forward.Rec);
++    defer gpa.destroy(r);
++    r.* = .{};
++    q.forward.rec = r;
++    try q.forward.run(m, s, cache, &.{token}, .last, null);
++    q.forward.rec = null;
++    var vars: std.ArrayList([]const u8) = .empty;
++    defer vars.deinit(gpa);
++    try vars.append(gpa, "");
++    var it = std.mem.splitScalar(u8, spec[eq + 1 ..], '+');
++    while (it.next()) |v| try vars.append(gpa, v);
++    // DS_COLD: a 256 MB read (DS_EXP's ds_exp_thrash) before each replay, its own time taken off: caches cold
++    const cold = std.c.getenv("DS_COLD") != null;
++    const thrash: ?mtl.Pipeline = if (cold) try mtl.Pipeline.init(m.device, lib, "ds_exp_thrash", false) else null;
++    const junk: ?mtl.Buffer = if (cold) try m.device.buffer(256 << 20, mtl.ResourceOptions.private) else null;
++    defer if (junk) |j| j.deinit();
++    var thrash_us: f64 = 0;
++    if (thrash) |tp| {
++        var best: f64 = std.math.inf(f64);
++        for (0..3) |_| {
++            const cb = m.queue.commandBufferUnretained();
++            const e = cb.compute(.concurrent);
++            for (0..40) |_| encodeThrash(e, tp, junk.?, s);
++            e.end();
++            cb.commit();
++            cb.wait();
++            best = @min(best, cb.gpuSeconds());
++        }
++        thrash_us = best / 40 * 1e6;
++        std.debug.print("rx cold: a 256 MB read takes {d:.1} us, taken off each\n", .{thrash_us});
++    }
++    for (vars.items) |v| {
++        const alt: ?mtl.Pipeline = if (v.len == 0) null else try mtl.Pipeline.init(m.device, lib, v, false);
++        var sum: f64 = 0;
++        var count: usize = 0;
++        for (0..r.n) |i| {
++            if (!r.items[i].ok or !std.mem.eql(u8, r.name(i), name)) continue;
++            const orig = r.items[i].pipe;
++            if (alt) |p| r.items[i].pipe = p;
++            defer r.items[i].pipe = orig;
++            var best: f64 = std.math.inf(f64);
++            for (0..3) |_| {
++                const cb = m.queue.commandBufferUnretained();
++                const e = cb.compute(.concurrent);
++                for (0..40) |_| {
++                    if (thrash) |tp| encodeThrash(e, tp, junk.?, s);
++                    e.barrier();
++                    r.encode(i, e);
++                }
++                e.end();
++                cb.commit();
++                cb.wait();
++                best = @min(best, cb.gpuSeconds());
++            }
++            sum += best / 40 * 1e6 - thrash_us;
++            count += 1;
++        }
++        std.debug.print("rx {s:<20} {s:<28} {d:7.2} us a dispatch over {d}\n", .{ name, if (v.len == 0) "(its own)" else v, sum / @as(f64, @floatFromInt(@max(count, 1))), count });
++    }
++}
++
++fn encodeThrash(e: mtl.ComputeEncoder, p: mtl.Pipeline, junk: mtl.Buffer, s: *q.state.Scratch) void {
++    e.barrier();
++    e.setPipeline(p);
++    e.setBuffer(junk, 0, 0);
++    e.setBuffer(s.counts, 0, 1);
++    const n: u32 = @intCast((256 << 20) / 16);
++    e.setBytes(std.mem.asBytes(&n), 2);
++    e.dispatchThreads(mtl.Size.of(8192 * 256, 1, 1), mtl.Size.of(256, 1, 1));
++}
++
++/// One decode row recorded (forward.Rec), then each recorded dispatch alone, 40 times in a command buffer with a
++/// barrier before each: its latency as a dependent step, summed by label. Last in a sweep: the replays write the
++/// scratch and cache again.
++fn replay(gpa: std.mem.Allocator, m: *q.Model, s: *q.state.Scratch, cache: *q.state.Cache, token: u32) !void {
++    const r = try gpa.create(q.forward.Rec);
++    defer gpa.destroy(r);
++    r.* = .{};
++    q.forward.rec = r;
++    try q.forward.run(m, s, cache, &.{token}, .last, null);
++    q.forward.rec = null;
++    const reps = 40;
++    var names: std.StringArrayHashMapUnmanaged([2]f64) = .empty;
++    defer names.deinit(gpa);
++    var total: f64 = 0;
++    for (0..r.n) |i| {
++        if (!r.items[i].ok) continue;
++        var best: f64 = std.math.inf(f64);
++        for (0..3) |_| {
++            const cb = m.queue.commandBufferUnretained();
++            const e = cb.compute(.concurrent);
++            for (0..reps) |_| {
++                e.barrier();
++                r.encode(i, e);
++            }
++            e.end();
++            cb.commit();
++            cb.wait();
++            best = @min(best, cb.gpuSeconds());
++        }
++        const us = best / reps * 1e6;
++        total += us;
++        const g = try names.getOrPut(gpa, r.name(i));
++        if (!g.found_existing) g.value_ptr.* = .{ 0, 0 };
++        g.value_ptr[0] += us;
++        g.value_ptr[1] += 1;
++    }
++    const Row = struct { name: []const u8, us: f64, count: f64 };
++    var rows: std.ArrayList(Row) = .empty;
++    defer rows.deinit(gpa);
++    var it = names.iterator();
++    while (it.next()) |e| try rows.append(gpa, .{ .name = e.key_ptr.*, .us = e.value_ptr[0], .count = e.value_ptr[1] });
++    std.mem.sort(Row, rows.items, {}, struct {
++        fn lt(_: void, a: Row, b: Row) bool {
++            return a.us > b.us;
++        }
++    }.lt);
++    std.debug.print("replay {d} dispatches recorded: {d:.0} us as dependent steps\n", .{ r.n, total });
++    for (rows.items) |x| std.debug.print("replay {s:<28} {d:7.0} us  {d:4.0} dispatches  {d:6.1} us each\n", .{ x.name, x.us, x.count, x.us / x.count });
++}
++
++/// One decode row with every barrier turned into an encoder boundary (forward.Lat): GPU µs by dispatch group summed
++/// by its first dispatch's label, the time between groups, and the call's total; the best of 5 calls a group.
++fn latency(gpa: std.mem.Allocator, m: *q.Model, s: *q.state.Scratch, cache: *q.state.Cache, token: u32) !void {
++    var l = try q.forward.Lat.init(m.device);
++    defer l.deinit();
++    const base = cache.len;
++    var best: [q.forward.Lat.max]f64 = @splat(std.math.inf(f64));
++    var gap_best: [q.forward.Lat.max]f64 = @splat(std.math.inf(f64));
++    var n: usize = 0;
++    try q.forward.run(m, s, cache, &.{token}, .last, null);
++    const plain = try gpa.dupe(u16, cache.logits.slice(u16, c.vocab));
++    defer gpa.free(plain);
++    for (0..6) |rep| {
++        l.n = 0;
++        cache.len = base;
++        const c0 = mtl.counters.sampleClocks(m.device);
++        q.forward.lat = &l;
++        defer q.forward.lat = null;
++        try q.forward.run(m, s, cache, &.{token}, .last, null);
++        q.forward.lat = null;
++        if (!std.mem.eql(u16, plain, cache.logits.slice(u16, c.vocab))) std.debug.print("lat: logits differ from the plain call's (a group lost its state)\n", .{});
++        const c1 = mtl.counters.sampleClocks(m.device);
++        const ns_tick = @as(f64, @floatFromInt(c1.cpu - c0.cpu)) / @as(f64, @floatFromInt(c1.gpu - c0.gpu));
++        n = l.n;
++        if (rep == 0) continue; // pipelines warm
++        const r = try l.samples.resolveCompleted(2 * n);
++        defer r.deinit();
++        const t = r.values();
++        for (0..n) |i| {
++            const d = @as(f64, @floatFromInt(t[2 * i + 1].timestamp -% t[2 * i].timestamp)) * ns_tick / 1e3;
++            best[i] = @min(best[i], d);
++            if (i + 1 < n) gap_best[i] = @min(gap_best[i], @as(f64, @floatFromInt(t[2 * i + 2].timestamp -% t[2 * i + 1].timestamp)) * ns_tick / 1e3);
++        }
++    }
++    var names: std.StringArrayHashMapUnmanaged([2]f64) = .empty;
++    defer names.deinit(gpa);
++    var busy: f64 = 0;
++    var gaps: f64 = 0;
++    for (0..n) |i| {
++        const g = try names.getOrPut(gpa, l.name(i));
++        if (!g.found_existing) g.value_ptr.* = .{ 0, 0 };
++        g.value_ptr[0] += best[i];
++        g.value_ptr[1] += 1;
++        busy += best[i];
++        if (i + 1 < n) gaps += gap_best[i];
++    }
++    const Row = struct { name: []const u8, us: f64, count: f64 };
++    var rows: std.ArrayList(Row) = .empty;
++    defer rows.deinit(gpa);
++    var it = names.iterator();
++    while (it.next()) |e| try rows.append(gpa, .{ .name = e.key_ptr.*, .us = e.value_ptr[0], .count = e.value_ptr[1] });
++    std.mem.sort(Row, rows.items, {}, struct {
++        fn lt(_: void, a: Row, b: Row) bool {
++            return a.us > b.us;
++        }
++    }.lt);
++    std.debug.print("lat groups {d}: busy {d:.0} us, between groups {d:.0} us\n", .{ n, busy, gaps });
++    for (rows.items) |r| std.debug.print("lat {s:<28} {d:7.0} us  {d:4.0} groups  {d:6.1} us each\n", .{ r.name, r.us, r.count, r.us / r.count });
+ }
+ 
+ /// The routed experts' row kernel alone, on a decode row's six picks (the scratch's last route): one matrix of each of
+-- 
+2.54.0 (Apple Git-157)
+

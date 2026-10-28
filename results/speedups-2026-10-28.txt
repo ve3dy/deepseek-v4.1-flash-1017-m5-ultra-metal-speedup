@@ -1,0 +1,39 @@
+Decode speedups on the M5 Ultra (64-core GPU), DeepSeek-V4.1-Flash-1017 TF-iQ-heretic. Every step's decode-row logits
+are byte-identical to the reference engine's (f3d8e5e4: 72a552ed + the residency patch), checked with tools/gate.sh:
+a decode row's logits (DS_REF), 128 greedy tokens plain and DSpark-drafted against the reference's, and four shared
+streams against each alone (108/108 rows, 32/32 drafts equal).
+
+== a decode row after a 229-token prompt (tf-dsv41-forward DS_SWEEP, 48 calls)
+reference f3d8e5e4                                             15.62 ms
++ RoPE table a call (split, merge, kv_finish, rope read it)
++ the merge's partials loaded before its softmax totals
++ one-barrier routing (each simdgroup's top-6, then the top-6 of those)   15.15 ms
++ the first two layers committed while the host encodes the rest           14.73 ms  (host 0.72 -> 0.29 ms a call)
++ compressor / indexer steps side by side where independent               14.57 ms  (barriers 764 -> 730)
+128 greedy tokens: 62.4 tok/s (reference) -> 66.5 tok/s
+
+== served through llama-swap (bench/bench.py, 512-token replies, thinking off, drafts on)
+                 reference (10-27)   58ef703f
+prose            61.8                66.3
+code             90.8                91.3
+JSON             110.9               114.8
+list             108.0               108.5
+4 streams        112.7               115.7
+prefill 8k, both engines on the same run (DS_PREFILL): 1,263 / 1,257 vs 1,262 / 1,267 tok/s: unchanged
+load-time window ms by width 1 / 2 / 4 / 6: 15.7 / 21.2 / 30.3 / 38.3 -> 14.7 / 19.9 / 29.5 / 37.1
+
+== tried, measured, not kept (all bit-identical unless noted)
+expand + boundary in one dispatch, the row's last threadgroup on the boundary, 20 x 256 with the 1,024-thread
+  reductions emulated in order: logits equal, 15.40 ms against 14.82: slower (the boundary's work on 256 threads)
+routed-expert row kernel at 13 other shapes: all slower than 4 x 2
+row kernels with the next pass's codes prefetched: 15.78 ms against 15.63
+router gemv unrolled 4 steps: no change; 1, 2 or 4 simdgroups a threadgroup: within 0.03 ms
+split attention's 16 dots before their simd_sums: 0.07 ms slower
+expand_mix with its mix weights loaded first: 0.06 ms slower
+serial encoder: 16.9 ms; polling the command buffer instead of waitUntilCompleted: -0.05 ms for a busy core (not kept)
+GPU performance state during decode (Metal System Trace): Maximum; a GPU heater beside it: no change
+WindowServer and another app used ~2.3% of the GPU during decode (20.9 + 4.5 ms over 1.12 s)
+
+== where a decode row's time goes now (isolated replays, a dependent step each: tf-dsv41-forward DS_SWEEP=replay)
+attention split 17.6 us x 40, merge 8.5 x 40, hc boundary 8.1 x 80, expand_mix 6.7 x 77, router gemv 11 x 46,
+route 6.7 x 40, rms 5 x 48; a tiny dependent dispatch costs ~2 us. All barriers removed (wrong output): 8.35 ms.

@@ -1,0 +1,88 @@
+From 69d33743e02da79b41927c6deeaa3f80785fab16 Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:31:19 +0700
+Subject: [PATCH 3/6] deepseek_v41 check: DS_SWEEP=kbench times the routed
+ experts' row kernel alone over the 40 layers, with barriers and overlapped
+
+---
+ zig/build/metal_targets.zig |  2 +-
+ zig/tests/dsv41_forward.zig | 43 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/zig/build/metal_targets.zig b/zig/build/metal_targets.zig
+index 1ff0178e7..bbaef31f7 100644
+--- a/zig/build/metal_targets.zig
++++ b/zig/build/metal_targets.zig
+@@ -287,7 +287,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
+         .{ .name = "tf-lfm2-forward", .path = "zig/tests/lfm2_forward.zig", .about = "LFM2-MoE native teacher-forced logits" },
+         .{ .name = "tf-lfm2-bench", .path = "zig/tests/lfm2_bench.zig", .about = "LFM2-MoE prompt-chunk and one-row decode timing" },
+         .{ .name = "tf-lfm2-exact", .path = "zig/tests/lfm2_exact.zig", .about = "LFM2-MoE prompt chunks, windows and committed-state exactness" },
+-        .{ .name = "tf-dsv41-forward", .path = "zig/tests/dsv41_forward.zig", .about = "DeepSeek-V4.1-Flash: token ids through the native forward, each block's streams and the logits written for the reference (MODEL_DIR IDS OUT_DIR [CHUNK]); DS_PROFILE (ms by section), DS_TIMING (encode and GPU ms a call), DS_SKIP=k1,k2 or !k1,k2 (pipelines left out), DS_DRAFT=N (N greedy tokens plain and DSpark-drafted, the plain reply to greedy.bin), DS_DEPTH=d1,d2 (a chunk and a decode row timed at each depth), DS_SHARED=N (N rounds of four streams' windows in one forward against each alone: equal logits and drafts), DS_SWEEP=1 or k1,k2 (one load: a decode row timed whole with each key left out, \"!\" for all, \"nobar\" without barriers, \"serial\" on a serial encoder, \"nb:label\" without the barrier before that dispatch, \"trace\" for the call's dispatches; dispatches, barriers and logits equality a key)" },
++        .{ .name = "tf-dsv41-forward", .path = "zig/tests/dsv41_forward.zig", .about = "DeepSeek-V4.1-Flash: token ids through the native forward, each block's streams and the logits written for the reference (MODEL_DIR IDS OUT_DIR [CHUNK]); DS_PROFILE (ms by section), DS_TIMING (encode and GPU ms a call), DS_SKIP=k1,k2 or !k1,k2 (pipelines left out), DS_DRAFT=N (N greedy tokens plain and DSpark-drafted, the plain reply to greedy.bin), DS_DEPTH=d1,d2 (a chunk and a decode row timed at each depth), DS_SHARED=N (N rounds of four streams' windows in one forward against each alone: equal logits and drafts), DS_SWEEP=1 or k1,k2 (one load: a decode row timed whole with each key left out, \"!\" for all, \"nobar\" without barriers, \"serial\" on a serial encoder, \"nb:label\" without the barrier before that dispatch, \"trace\" for the call's dispatches, \"kbench\" for the routed experts' kernel alone over the 40 layers; dispatches, barriers and logits equality a key)" },
+         .{ .name = "tf-dsv41-vision", .path = "zig/tests/dsv41_vision.zig", .about = "DeepSeek-V4.1-Flash: the image tower and aligner on given patches, its rows written for the reference (MODEL_DIR PATCHES N_H N_W OUT)" },
+         .{ .name = "tf-lfm2-fp64", .path = "zig/tests/lfm2_fp64.zig", .about = "LFM2 projection classes and attention on the tensor units, the tiles and the twin, each against float64" },
+         .{ .name = "tensorfold", .path = "zig/src/main.zig", .about = "The native engine's command line" },
+diff --git a/zig/tests/dsv41_forward.zig b/zig/tests/dsv41_forward.zig
+index acdf1ad08..9bde2a907 100644
+--- a/zig/tests/dsv41_forward.zig
++++ b/zig/tests/dsv41_forward.zig
+@@ -271,6 +271,10 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+             std.debug.print("\n", .{});
+             continue;
+         }
++        if (std.mem.eql(u8, key, "kbench")) {
++            try kbench(m, &scratch);
++            continue;
++        }
+         q.forward.no_barriers = std.mem.eql(u8, key, "nobar");
+         q.forward.serial = std.mem.eql(u8, key, "serial");
+         q.forward.nobar_before = if (std.mem.startsWith(u8, key, "nb:")) key[3..] else null;
+@@ -306,6 +310,45 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+     q.forward.nobar_before = null;
+ }
+ 
++/// The routed experts' row kernel alone, on a decode row's six picks (the scratch's last route): one matrix of each of
++/// the 40 layers in turn (1-2 GB, past the caches), with a barrier before each dispatch and without; µs and GB/s.
++fn kbench(m: *q.Model, s: *q.state.Scratch) !void {
++    const rp = @import("tensorfold").row_projection;
++    for ([_][]const u8{ "w1", "w2" }) |name| {
++        const down = std.mem.eql(u8, name, "w2");
++        for ([_]bool{ true, false }) |barriers| {
++            var best: f64 = std.math.inf(f64);
++            var bytes: usize = 0;
++            for (0..4) |_| {
++                bytes = 0;
++                const cb = m.queue.commandBufferUnretained();
++                const e = cb.compute(.concurrent);
++                for (&m.weights.layers) |*l| {
++                    const x = if (down) l.moe.w2 else l.moe.w1;
++                    const call = try rp.callIndexed(&m.kernels.rows, x, c.topk, false);
++                    const w = x.one;
++                    bytes += c.topk * (w.n * w.k * w.bits / 8 + w.n * (w.k / w.group) * 4);
++                    e.setPipeline(call.pipeline);
++                    e.setBuffer(if (down) s.act else s.normed, 0, 0);
++                    e.setBuffer(w.w, w.w_off, 1);
++                    e.setBuffer(w.scales, w.s_off, 2);
++                    e.setBuffer(w.biases, w.b_off, 3);
++                    e.setBytes(std.mem.asBytes(&call.dims), 4);
++                    e.setBuffer(if (down) s.experts else s.gate, 0, 5);
++                    e.setBuffer(s.route_pick, 0, 6);
++                    if (barriers) e.barrier();
++                    e.dispatchThreads(mtl.Size.of(call.groups * call.threads, call.slots, 1), mtl.Size.of(call.threads, 1, 1));
++                }
++                e.end();
++                cb.commit();
++                cb.wait();
++                best = @min(best, cb.gpuSeconds());
++            }
++            std.debug.print("kbench {s} x6 over 40 layers {s}: {d:.1} us a layer, {d:.0} GB/s ({d:.2} GB)\n", .{ name, if (barriers) "barriers" else "overlapped", best / 40 * 1e6, @as(f64, @floatFromInt(bytes)) / best / 1e9, @as(f64, @floatFromInt(bytes)) / 1e9 });
++        }
++    }
++}
++
+ /// Four streams' windows of 1 to 6 rows in one forward a round against each alone: equal logits and drafts.
+ fn shared(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, rounds: usize) !void {
+     const k = q.backend.max_streams;
+-- 
+2.54.0 (Apple Git-157)
+

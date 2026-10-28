@@ -1,0 +1,25 @@
+Routed experts' row kernel (core/row_projection tf_row_projection_indexed), decode row, 6 picks a layer.
+M5 Ultra 64-core GPU, DeepSeek-V4.1-Flash-1017 TF-iQ-heretic, engine f3d8e5e4 + patches 0002-0003.
+
+== the kernel alone, one matrix of each of the 40 layers in turn (1.06 GB a pass, past the caches; DS_SWEEP=kbench)
+w1 (2304 x 5120, 2/3-bit)  with a barrier before each:  33.0 us a layer,  805 GB/s
+w1                          overlapped (no barriers):   24.5 us a layer, 1082 GB/s
+w2 (5120 x 2304, 2/3-bit)  with a barrier before each:  34.2 us a layer,  776 GB/s
+w2                          overlapped:                 26.1 us a layer, 1018 GB/s
+DRAM peak 1228 GB/s: overlapped, the kernel runs at 83-88% of it. A barrier before each dispatch costs ~8.5 us.
+
+== one layer's matrix repeated (stays in the system cache: not DRAM numbers)
+layer 5 w1 2-bit: 22.0 us with barriers, 17.4 us overlapped; layer 15 w1 3-bit: 31.6 / 25.9 us
+
+== the same kernel at other shapes in the whole decode call (columns a simdgroup . simdgroups a threadgroup,
+   gate/up - down); every shape's logits equal the default's bit for bit
+default 4.2-4.2   15.63 ms
+1.2-4.2 16.05  2.2-4.2 15.67  2.4-4.2 15.68  4.1-4.2 15.76  4.4-4.2 15.78  4.8-4.2 15.84  8.2-4.2 16.16
+4.2-1.2 15.96  4.2-2.2 15.71  4.2-2.4 15.70  4.2-4.1 15.75  4.2-4.4 15.77  4.2-4.8 15.81
+8 and 16 columns (both matrices): 16.19 / 17.03 ms
+The default shape is the fastest. Shapes are reverted.
+
+== conclusion
+The routed-expert kernel is not the bottleneck: on its own it reads at 83-88% of peak bandwidth. Its 5.3 ms in the
+leave-out sweep includes the barriers before its 120 dispatches a token. The time a token loses is the ~8.5 us
+each of its 764 dependent dispatches waits for the one before to drain.

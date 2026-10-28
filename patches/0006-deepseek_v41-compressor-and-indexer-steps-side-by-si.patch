@@ -1,0 +1,77 @@
+From 58ef703f4dc6a01bd88ecbd5b4b29ac24aecb903 Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:20:06 +0700
+Subject: [PATCH 6/6] deepseek_v41: compressor and indexer steps side by side
+ where independent (14.57 ms a decode row, logits bit-identical)
+
+---
+ zig/src/families/deepseek_v41_metal/index.zig | 20 +++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/deepseek_v41_metal/index.zig b/zig/src/families/deepseek_v41_metal/index.zig
+index 069da2485..b31143739 100644
+--- a/zig/src/families/deepseek_v41_metal/index.zig
++++ b/zig/src/families/deepseek_v41_metal/index.zig
+@@ -21,6 +21,7 @@ pub fn compress(x: Enc, si: usize, ratio: usize, cp: wts.Compressor, ix: wts.Ind
+     const rows = x.rows;
+     if (ratio > 1) {
+         x.gemv(true, cp.wkv, s.normed, 0, c.hidden, s.cproj, 0, rows, c.head_dim, c.hidden, c.head_dim);
++        x.with(); // the two projections of the same rows, side by side
+         x.gemv(true, cp.wgate.?, s.normed, 0, c.hidden, s.cscore, 0, rows, c.head_dim, c.hidden, c.head_dim);
+     } else {
+         x.gemv(false, cp.wkv, s.normed, 0, c.hidden, s.latent, 0, rows, c.head_dim, c.hidden, c.head_dim);
+@@ -37,6 +38,7 @@ fn compressOne(x: Enc, cache: *st.Cache, si: usize, ratio: usize, cp: wts.Compre
+     const hd = c.head_dim * 2;
+     if (ratio > 1) {
+         x.putF32(s.cproj, s.pos, cache.proj_kv[si].?, x.rows, c.head_dim, st.ring);
++        x.with();
+         x.putF32(s.cscore, s.pos, cache.proj_score[si].?, x.rows, c.head_dim, st.ring);
+         if (n == 0) return;
+         x.pipe("ds_pool2");
+@@ -51,16 +53,19 @@ fn compressOne(x: Enc, cache: *st.Cache, si: usize, ratio: usize, cp: wts.Compre
+         g.* = @intCast(span[0] + j);
+         p.* = @intCast((span[0] + j) * ratio);
+     }
+-    // index keys: k_norm(wk(latent)), RoPE'd at the group's first position, fp4 with e8m0 scales a 32
++    // index keys: k_norm(wk(latent)), RoPE'd at the group's first position, fp4 with e8m0 scales a 32; the latents
++    // RoPE'd at the same position, fp4 with e4m3 scales a 16: the two tails side by side once wk has read the latents
+     const kd = c.index_dim * 2;
+     x.gemv(false, ix.wk.?, s.latent, x.r0 * hd, c.head_dim, s.ik, x.r0 * kd, n, c.index_dim, c.head_dim, c.index_dim);
+     x.rms(s.ik, x.r0 * kd, ix.k_norm.?, s.ik, x.r0 * kd, n, c.index_dim);
+     x.rope(s.ik, n, 1, c.index_dim, s.gpos[si], freq, false);
+-    x.fp4(s.ik, n, c.index_dim, false);
+-    x.put(s.ik, s.gidx[si], src.keys, n, c.index_dim, 0);
+-    // the latents: RoPE'd at the same position, fp4 with e4m3 scales a 16
++    x.with();
+     x.rope(s.latent, n, 1, c.head_dim, s.gpos[si], freq, false);
++    x.fp4(s.ik, n, c.index_dim, false);
++    x.with();
+     x.fp4(s.latent, n, c.head_dim, true);
++    x.put(s.ik, s.gidx[si], src.keys, n, c.index_dim, 0);
++    x.with();
+     x.put(s.latent, s.gidx[si], src.latents, n, c.head_dim, 0);
+ }
+ 
+@@ -68,14 +73,17 @@ fn compressOne(x: Enc, cache: *st.Cache, si: usize, ratio: usize, cp: wts.Compre
+ pub fn index(x: Enc, si: usize, layer: usize, ratio: usize, ix: wts.Indexer, freq: Buffer) !void {
+     const s = x.s;
+     const rows = x.rows;
++    // the query side (wq_b of the q latent) and the weights (of the normed input) side by side
+     x.linear(ix.wq_b, s.qr, 0, s.iq, 0, rows);
+-    x.rope(s.iq, rows, c.index_heads, c.index_dim, s.pos, freq, false);
+-    x.fp4(s.iq, rows, c.index_heads * c.index_dim, false);
++    x.with();
+     x.gemv(false, ix.weights_proj, s.normed, 0, c.hidden, s.iw, 0, rows, c.index_heads, c.hidden, c.index_heads);
++    x.rope(s.iq, rows, c.index_heads, c.index_dim, s.pos, freq, false);
++    x.with();
+     x.pipe("ds_scale");
+     x.buf(s.iw, 0, 0);
+     x.args(@as(f32, 1.0 / @sqrt(@as(f32, c.index_dim)) * (1.0 / @sqrt(@as(f32, c.index_heads)))), 1);
+     x.threads(.{ rows * c.index_heads, 1, 1 }, .{ 256, 1, 1 });
++    x.fp4(s.iq, rows, c.index_heads * c.index_dim, false);
+     for (x.segs) |g| indexOne(x.of(g), &g.cache.sources[si], layer, ratio);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

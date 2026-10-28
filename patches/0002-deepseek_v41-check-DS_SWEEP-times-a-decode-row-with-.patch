@@ -1,0 +1,258 @@
+From b756551387044e52950874c9fbc550cda559b7e1 Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:11:59 +0700
+Subject: [PATCH 2/6] deepseek_v41 check: DS_SWEEP times a decode row with each
+ pipeline left out, without barriers, on a serial encoder, and traces its
+ dispatches
+
+---
+ zig/build/metal_targets.zig                   |  2 +-
+ .../families/deepseek_v41_metal/forward.zig   | 51 ++++++++++++-
+ zig/tests/dsv41_forward.zig                   | 75 +++++++++++++++++++
+ 3 files changed, 123 insertions(+), 5 deletions(-)
+
+diff --git a/zig/build/metal_targets.zig b/zig/build/metal_targets.zig
+index 9175ebe44..1ff0178e7 100644
+--- a/zig/build/metal_targets.zig
++++ b/zig/build/metal_targets.zig
+@@ -287,7 +287,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
+         .{ .name = "tf-lfm2-forward", .path = "zig/tests/lfm2_forward.zig", .about = "LFM2-MoE native teacher-forced logits" },
+         .{ .name = "tf-lfm2-bench", .path = "zig/tests/lfm2_bench.zig", .about = "LFM2-MoE prompt-chunk and one-row decode timing" },
+         .{ .name = "tf-lfm2-exact", .path = "zig/tests/lfm2_exact.zig", .about = "LFM2-MoE prompt chunks, windows and committed-state exactness" },
+-        .{ .name = "tf-dsv41-forward", .path = "zig/tests/dsv41_forward.zig", .about = "DeepSeek-V4.1-Flash: token ids through the native forward, each block's streams and the logits written for the reference (MODEL_DIR IDS OUT_DIR [CHUNK]); DS_PROFILE (ms by section), DS_TIMING (encode and GPU ms a call), DS_SKIP=k1,k2 or !k1,k2 (pipelines left out), DS_DRAFT=N (N greedy tokens plain and DSpark-drafted, the plain reply to greedy.bin), DS_DEPTH=d1,d2 (a chunk and a decode row timed at each depth), DS_SHARED=N (N rounds of four streams' windows in one forward against each alone: equal logits and drafts)" },
++        .{ .name = "tf-dsv41-forward", .path = "zig/tests/dsv41_forward.zig", .about = "DeepSeek-V4.1-Flash: token ids through the native forward, each block's streams and the logits written for the reference (MODEL_DIR IDS OUT_DIR [CHUNK]); DS_PROFILE (ms by section), DS_TIMING (encode and GPU ms a call), DS_SKIP=k1,k2 or !k1,k2 (pipelines left out), DS_DRAFT=N (N greedy tokens plain and DSpark-drafted, the plain reply to greedy.bin), DS_DEPTH=d1,d2 (a chunk and a decode row timed at each depth), DS_SHARED=N (N rounds of four streams' windows in one forward against each alone: equal logits and drafts), DS_SWEEP=1 or k1,k2 (one load: a decode row timed whole with each key left out, \"!\" for all, \"nobar\" without barriers, \"serial\" on a serial encoder, \"nb:label\" without the barrier before that dispatch, \"trace\" for the call's dispatches; dispatches, barriers and logits equality a key)" },
+         .{ .name = "tf-dsv41-vision", .path = "zig/tests/dsv41_vision.zig", .about = "DeepSeek-V4.1-Flash: the image tower and aligner on given patches, its rows written for the reference (MODEL_DIR PATCHES N_H N_W OUT)" },
+         .{ .name = "tf-lfm2-fp64", .path = "zig/tests/lfm2_fp64.zig", .about = "LFM2 projection classes and attention on the tensor units, the tiles and the twin, each against float64" },
+         .{ .name = "tensorfold", .path = "zig/src/main.zig", .about = "The native engine's command line" },
+diff --git a/zig/src/families/deepseek_v41_metal/forward.zig b/zig/src/families/deepseek_v41_metal/forward.zig
+index 272eeb501..43508839e 100644
+--- a/zig/src/families/deepseek_v41_metal/forward.zig
++++ b/zig/src/families/deepseek_v41_metal/forward.zig
+@@ -56,6 +56,36 @@ pub var timing: ?*[3]f64 = null;
+ /// A check's ablation (DS_SKIP): dispatches of the pipeline of this name are left out, to time what each costs.
+ pub var skip: ?[]const u8 = null;
+ var skipping = false;
++/// A check's counts of dispatches and barriers encoded (the family's own helpers; the core's encoders are not seen).
++pub var counted: [2]usize = .{ 0, 0 };
++/// A check's timing of the barriers: none is encoded (the results are wrong; only the time means anything).
++pub var no_barriers = false;
++/// A check's timing of one fusion: no barrier before dispatches whose trace label starts with one of these (wrong
++/// results; the time a fusion of that dispatch into the one before could save).
++pub var nobar_before: ?[]const u8 = null;
++fn dropped() bool {
++    const list = nobar_before orelse return false;
++    var it = std.mem.splitScalar(u8, list, '+');
++    while (it.next()) |k| if (k.len > 0 and std.mem.startsWith(u8, current, k)) return true;
++    return false;
++}
++/// A check's serial encoder: every dispatch waits on the one before it, no barrier encoded (`with` pairs run in turn).
++pub var serial = false;
++fn kind() mtl.DispatchType {
++    return if (serial) .serial else .concurrent;
++}
++/// A check's trace of one call: each dispatch's pipeline, "|" where a barrier goes (stderr).
++pub var trace = false;
++fn note(comptime f: []const u8, a: anytype) void {
++    if (trace) std.debug.print(f, a);
++}
++/// A projection's trace label, formatted only when a check reads it (trace, nobar_before).
++fn labelled(comptime f: []const u8, a: anytype) []const u8 {
++    if (!trace and nobar_before == null) return "";
++    return std.fmt.bufPrint(&label, f, a) catch "";
++}
++var current: []const u8 = "";
++var label: [64]u8 = undefined;
+ 
+ /// Whether DS_SKIP names `key`: a comma-separated list, or "!a,b" for everything but those.
+ fn skips(key: []const u8) bool {
+@@ -120,7 +150,7 @@ pub const Enc = struct {
+         if (self.cbp.*.status() != .completed) return error.DeepseekGpuFailed;
+         p[section] += self.cbp.*.gpuSeconds();
+         self.cbp.* = self.m.queue.commandBufferUnretained();
+-        self.ep.* = self.cbp.*.compute(.concurrent);
++        self.ep.* = self.cbp.*.compute(kind());
+     }
+ 
+     /// A concurrent encoder: each dispatch waits on all before it, unless `with` was called just before it.
+@@ -129,7 +159,9 @@ pub const Enc = struct {
+             joined = false;
+             return;
+         }
+-        self.ep.*.barrier();
++        counted[1] += 1;
++        note("\n| ", .{});
++        if (!no_barriers and !serial and !dropped()) self.ep.*.barrier();
+     }
+     /// A left-out dispatch (DS_SKIP) still takes a `with` meant for it, so the next one keeps its barrier.
+     fn skipped() bool {
+@@ -143,6 +175,7 @@ pub const Enc = struct {
+ 
+     pub fn pipe(self: Enc, comptime key: []const u8) void {
+         skipping = skips(key);
++        current = key;
+         self.ep.*.setPipeline(self.m.kernels.get(key));
+     }
+     /// DS_SKIP for a pipeline set by hand (the tensor-unit ones outside `names`).
+@@ -162,11 +195,15 @@ pub const Enc = struct {
+     pub fn threads(self: Enc, grid: [3]usize, group: [3]usize) void {
+         if (skipped()) return;
+         self.fence();
++        counted[0] += 1;
++        note("{s} ", .{current});
+         self.ep.*.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
+     }
+     pub fn groups(self: Enc, grid: [3]usize, group: [3]usize) void {
+         if (skipped()) return;
+         self.fence();
++        counted[0] += 1;
++        note("{s} ", .{current});
+         self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
+     }
+ 
+@@ -190,12 +227,16 @@ pub const Enc = struct {
+         if (self.m.kernels.tiles) |*t| if (kern.tiled(w)) {
+             if (row.simd_bits.call(t, w.bits, w.n, w.k, rows, w.n, rows <= 2)) |call| {
+                 const m = row.simd_bits.Matrix{ .w = w.w, .w_off = w.w_off, .scales = w.scales, .s_off = w.s_off, .biases = w.biases, .b_off = w.b_off };
++                current = labelled("rows[{d}x{d}:{d}b]", .{ w.n, w.k, w.bits });
+                 self.fence();
++                counted[0] += 1;
++                note("{s} ", .{current});
+                 row.simd_bits.encode(self.ep.*, call, m, x, x_off, y, y_off);
+                 return;
+             } else |_| {}
+         };
+         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
++        current = labelled("row[{d}x{d}:{d}b]", .{ w.n, w.k, w.bits });
+         self.ep.*.setPipeline(call.pipeline);
+         self.buf(x, x_off, 0);
+         self.buf(w.w, w.w_off, 1);
+@@ -211,6 +252,7 @@ pub const Enc = struct {
+         skipping = skips("indexed");
+         if (skipped()) return;
+         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
++        current = labelled("indexed[{d}x{d}:{d}b]", .{ x.one.n, x.one.k, x.one.bits });
+         self.ep.*.setPipeline(call.pipeline);
+         self.buf(in, 0, 0);
+         self.buf(x.one.w, x.one.w_off, 1);
+@@ -512,7 +554,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+     _ = std.c.clock_gettime(.MONOTONIC, &t_start);
+     var cb = m.queue.commandBufferUnretained(); // every buffer it binds is the model's or the scratch's; cb.wait() below
+     const w = &m.weights;
+-    var e = cb.compute(.concurrent);
++    var e = cb.compute(kind());
+     pending_expand = false;
+     pending_topk = 0;
+     const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = s, .rows = rows, .base = segs[0].cache.len, .units = segs.len == 1 and rows >= nax_rows, .segs = segs };
+@@ -545,6 +587,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+             x.args([2]i32{ @intCast(t * c.hidden), @intCast(c.draft_targets.len * c.hidden) }, 2);
+             x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+         };
++        note("\n=== layer {d}", .{i});
+         try layer.block(x, i, l);
+         if (dump) |d| { // the streams after each block: the buffers are untracked, so each block completes first
+             x.flush();
+@@ -554,7 +597,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+             if (cb.status() != .completed) return error.DeepseekGpuFailed;
+             @memcpy(d.layers[i].contents()[0 .. rows * c.hc * c.hidden * 2], s.x.contents()[0 .. rows * c.hc * c.hidden * 2]);
+             cb = m.queue.commandBufferUnretained();
+-            e = cb.compute(.concurrent);
++            e = cb.compute(kind());
+         }
+     }
+     if (drafting) dspark.condition(x);
+diff --git a/zig/tests/dsv41_forward.zig b/zig/tests/dsv41_forward.zig
+index 8d6025a4a..acdf1ad08 100644
+--- a/zig/tests/dsv41_forward.zig
++++ b/zig/tests/dsv41_forward.zig
+@@ -27,6 +27,7 @@ pub fn main(init: std.process.Init) !void {
+     if (std.c.getenv("DS_SHARED")) |n| return shared(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
+     if (std.c.getenv("DS_INDEX_ROWS") != null) q.forward.index_nax = false;
+     if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d), if (args.len == 5) chunk else 256);
++    if (std.c.getenv("DS_SWEEP") != null) return sweep(gpa, init.io, args[1], ids);
+     var t0: std.c.timespec = undefined;
+     _ = std.c.clock_gettime(.MONOTONIC, &t0);
+     const m = try q.Model.load(gpa, init.io, args[1], false);
+@@ -231,6 +232,80 @@ fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u
+     }
+ }
+ 
++/// One load: a decode row after the prompt, timed whole with each pipeline left out in turn (DS_SKIP's keys), with
++/// every named pipeline left out ("!"), without barriers ("nobar") or on a serial encoder ("serial"); dispatches and
++/// barriers a call, and whether the row's logits equal the plain run's bit for bit. DS_SWEEP=k1,k2 times those only.
++fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u32) !void {
++    const m = try q.Model.load(gpa, io, dir, false);
++    defer m.deinit();
++    var scratch = try q.state.Scratch.init(gpa, m.device, 128);
++    defer scratch.deinit();
++    var cache = try q.state.Cache.init(gpa, m.device, prompt.len + 512);
++    defer cache.deinit();
++    var at: usize = 0;
++    while (at < prompt.len) : (at += 128) try q.forward.run(m, &scratch, &cache, prompt[at..@min(prompt.len, at + 128)], .last, null);
++    const base = cache.len;
++    const token = argmax(cache.logits.slice(u16, c.vocab));
++    const extra = [_][]const u8{ "rows", "indexed", "!", "nobar", "serial" };
++    var keys: std.ArrayList([]const u8) = .empty;
++    defer keys.deinit(gpa);
++    try keys.append(gpa, "");
++    const asked = std.mem.span(std.c.getenv("DS_SWEEP").?);
++    if (std.mem.eql(u8, asked, "1")) {
++        try keys.appendSlice(gpa, &q.kernels.names);
++        try keys.appendSlice(gpa, &extra);
++    } else {
++        var it = std.mem.splitScalar(u8, asked, ',');
++        while (it.next()) |k| try keys.append(gpa, k);
++    }
++    const plain = try gpa.alloc(u16, c.vocab);
++    defer gpa.free(plain);
++    var baseline: f64 = 0;
++    const reps = 48;
++    for (keys.items) |key| {
++        if (std.mem.eql(u8, key, "trace")) {
++            cache.len = base;
++            q.forward.trace = true;
++            try q.forward.run(m, &scratch, &cache, &.{token}, .last, null);
++            q.forward.trace = false;
++            std.debug.print("\n", .{});
++            continue;
++        }
++        q.forward.no_barriers = std.mem.eql(u8, key, "nobar");
++        q.forward.serial = std.mem.eql(u8, key, "serial");
++        q.forward.nobar_before = if (std.mem.startsWith(u8, key, "nb:")) key[3..] else null;
++        q.forward.skip = if (key.len == 0 or q.forward.no_barriers or q.forward.serial or q.forward.nobar_before != null) null else key;
++        for (0..4) |_| {
++            cache.len = base;
++            try q.forward.run(m, &scratch, &cache, &.{token}, .last, null);
++        }
++        q.forward.counted = .{ 0, 0 };
++        var best: f64 = std.math.inf(f64);
++        var sum: f64 = 0;
++        for (0..reps) |_| {
++            cache.len = base;
++            var t0: std.c.timespec = undefined;
++            var t1: std.c.timespec = undefined;
++            _ = std.c.clock_gettime(.MONOTONIC, &t0);
++            try q.forward.run(m, &scratch, &cache, &.{token}, .last, null);
++            _ = std.c.clock_gettime(.MONOTONIC, &t1);
++            const s = seconds(t0, t1);
++            best = @min(best, s);
++            sum += s;
++        }
++        const row = cache.logits.slice(u16, c.vocab);
++        if (key.len == 0) @memcpy(plain, row);
++        const equal = std.mem.eql(u16, plain, row);
++        const mean = sum * 1e3 / reps;
++        if (key.len == 0) baseline = mean;
++        std.debug.print("sweep {s:<24} {d:7.2} ms mean {d:7.2} best  saves {d:6.2}  dispatches {d} barriers {d}  logits {s}\n", .{ if (key.len == 0) "(none)" else key, mean, best * 1e3, baseline - mean, q.forward.counted[0] / reps, q.forward.counted[1] / reps, if (equal) "equal" else "differ" });
++    }
++    q.forward.no_barriers = false;
++    q.forward.serial = false;
++    q.forward.skip = null;
++    q.forward.nobar_before = null;
++}
++
+ /// Four streams' windows of 1 to 6 rows in one forward a round against each alone: equal logits and drafts.
+ fn shared(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, rounds: usize) !void {
+     const k = q.backend.max_streams;
+-- 
+2.54.0 (Apple Git-157)
+

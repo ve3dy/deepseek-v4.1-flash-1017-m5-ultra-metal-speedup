@@ -1,0 +1,64 @@
+From a424d0fe6bcefe874ce5a586f7a933d1c33debcc Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:47:27 +0700
+Subject: [PATCH] deepseek_v41: the early-committed command buffer kept, its
+ failure reported and its GPU time counted
+
+---
+ .../families/deepseek_v41_metal/forward.zig   | 20 +++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/deepseek_v41_metal/forward.zig b/zig/src/families/deepseek_v41_metal/forward.zig
+index 4a8e03ec8..79dafd096 100644
+--- a/zig/src/families/deepseek_v41_metal/forward.zig
++++ b/zig/src/families/deepseek_v41_metal/forward.zig
+@@ -761,7 +761,10 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+             x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+         };
+         note("\n=== layer {d}", .{i});
+-        if (i == 0) first = null;
++        if (i == 0) if (first) |f| { // a call that failed after its early commit
++            f.release();
++            first = null;
++        };
+         try layer.block(x, i, l);
+         // the first layers run while the host encodes the rest (a GPU event orders the two command buffers)
+         if (i + 1 == early_commit and dump == null and profile == null and lat == null) {
+@@ -772,7 +775,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+             early_value += 1;
+             e.end();
+             cb.signalEvent(ev, early_value);
+-            if (span != null) first = cb.retain();
++            first = cb.retain(); // the call's first layers: checked, timed and released after its wait
+             cb.commit();
+             cb = m.queue.commandBufferUnretained();
+             cb.waitForEvent(ev, early_value);
+@@ -822,16 +825,21 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+         const start = if (first) |f| f.gpuStart() else cb.gpuStart();
+         sp.* += cb.gpuEnd() - start;
+     }
+-    if (first) |f| f.release();
+-    first = null;
+-    if (profile) |p| p[9] += cb.gpuSeconds();
++    const early_ok = if (first) |f| f.status() == .completed else true;
+     if (timing) |t| {
+         var t_end: std.c.timespec = undefined;
+         _ = std.c.clock_gettime(.MONOTONIC, &t_end);
+         t[0] += secs(t_start, t_commit);
+-        t[1] += cb.gpuSeconds();
++        t[1] += cb.gpuSeconds() + if (first) |f| f.gpuSeconds() else 0;
+         t[2] += secs(t_start, t_end);
+     }
++    if (first) |f| {
++        if (!early_ok) if (f.failure()) |why| std.log.err("deepseek_v41: the forward's first layers failed: {s}", .{why});
++        f.release();
++    }
++    first = null;
++    if (profile) |p| p[9] += cb.gpuSeconds();
++    if (!early_ok) return error.DeepseekGpuFailed;
+     if (cb.status() != .completed) {
+         if (cb.failure()) |why| std.log.err("deepseek_v41: the forward failed: {s}", .{why});
+         return error.DeepseekGpuFailed;
+-- 
+2.54.0 (Apple Git-157)
+

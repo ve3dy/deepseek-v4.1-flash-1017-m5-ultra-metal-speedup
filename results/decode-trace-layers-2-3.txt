@@ -1,0 +1,56 @@
+=== layer 2
+| ds_hc_expand_mix 
+| ds_hc_boundary 
+| rows[1280x5120:4b] rows[512x5120:4b] 
+| ds_rms ds_kv_finish 
+| rows[32768x1280:4b] 
+| ds_gemv_bf_f32 
+| ds_gemv_bf_f32 
+| ds_put_rows_f32 
+| ds_put_rows_f32 
+| ds_pool2 
+| ds_rms 
+| ds_gemv_bf_bf 
+| ds_rms 
+| ds_rope 
+| ds_fp4_qdq 
+| ds_put_rows 
+| ds_rope 
+| ds_fp4_qdq 
+| ds_put_rows 
+| rows[4096x1280:4b] 
+| ds_rope 
+| ds_fp4_qdq 
+| ds_gemv_bf_bf 
+| ds_scale 
+| ds_index_scores_1x8 
+| ds_topk_bf 
+| ds_attend_split 
+| ds_attend_merge 
+| indexed[1024x4096:4b] 
+| rows[5120x8192:4b] 
+| ds_hc_expand_mix 
+| ds_hc_boundary 
+| ds_gemv_bf_f32 rows[2304x5120:4b] rows[2304x5120:4b] 
+| ds_route ds_swiglu 
+| indexed[2304x5120:2b] indexed[2304x5120:2b] rows[5120x2304:4b] 
+| ds_swiglu 
+| indexed[5120x2304:2b] 
+=== layer 3
+| ds_hc_expand_mix 
+| ds_hc_boundary 
+| rows[1280x5120:4b] rows[512x5120:4b] 
+| ds_rms ds_kv_finish 
+| rows[32768x1280:4b] 
+| ds_attend_split 
+| ds_attend_merge 
+| indexed[1024x4096:4b] 
+| rows[5120x8192:4b] 
+| ds_hc_expand_mix 
+| ds_hc_boundary 
+| ds_gemv_bf_f32 rows[2304x5120:4b] rows[2304x5120:4b] 
+| ds_route ds_swiglu 
+| indexed[2304x5120:2b] indexed[2304x5120:2b] rows[5120x2304:4b] 
+| ds_swiglu 
+| indexed[5120x2304:2b] 
+=== layer 4

@@ -1,0 +1,29 @@
+DeepSeek-V4.1-Flash-1017 TF-iQ-heretic, M5 Ultra 64-core GPU, engine f3d8e5e4 (BobClawblaw 72a552ed + queue-residency patch)
+One decode row after a 229-token prose prompt, 48 timed calls a key, tf-dsv41-forward DS_SWEEP.
+
+== encoder and barriers
+(none)    15.61 ms mean  15.51 best  dispatches 1044 barriers 764  logits equal
+serial    16.87 ms mean  16.79 best  (serial encoder, no barriers: slower)  logits equal
+nobar      9.04 ms mean   8.96 best  (no barriers at all: wrong output, timing only)  logits differ
+
+== one barrier class dropped (wrong output; an upper bound on what fusing that dispatch into the one before saves)
+nb:indexed[5120x2304   saves 0.09 ms   (routed w2 after swiglu)
+nb:ds_swiglu           saves 0.10 ms
+nb:ds_attend_merge     saves 0.25 ms
+nb:ds_hc_boundary      saves 0.83 ms
+nb:ds_hc_expand_mix    saves 0.59 ms
+nb:rows[32768          saves 0.29 ms   (wq_b after q_norm)
+nb:ds_route            saves 0.20 ms
+nb:rows[5120x8192      saves 0.28 ms   (wo_b after wo_a)
+all of the above but wo_b together: 13.16 ms mean, saves 2.46 ms
+
+== fusion tried: ds_hc_expand_mix + ds_hc_boundary in one dispatch (last threadgroup a row runs the boundary)
+fused     15.81 ms mean  15.74 best  dispatches 967 barriers 687
+unfused   15.61 ms mean  15.46 best  dispatches 1044 barriers 764
+Logits of the decode row equal bit for bit; a 128-token greedy reply identical to the unfused engine's.
+Slower by 0.2 ms: the boundary still waits for every slice, now inside the dispatch. Reverted.
+
+== the served engine, same machine
+plain 62.5 tok/s (DS_DRAFT=128: 128 greedy tokens), a call 15.43 ms after the first, encode 0.38 ms, GPU 14.83 ms
+load-time costs (server log): window ms by width 1 15.7, 2 21.2, 4 30.3, 6 38.3; a draft round 2.9 ms
+through llama-swap: prose drafts on 61.0 / 62.3 tok/s, drafts off 63.0 / 62.8; code on 88.7 / 91.0, off 62.8 / 62.7

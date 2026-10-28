@@ -1,0 +1,161 @@
+From ca7d310ad38b8373b3b47400247fa74c8150d52e Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:12:02 +0700
+Subject: [PATCH 5/6] deepseek_v41: the first two layers commit while the host
+ encodes the rest (14.73 ms a decode row, host 0.29 ms); ds_gemv's simdgroups
+ a threadgroup a knob; checks: span, spin
+
+---
+ zig/kernels/metal/deepseek/v41.metal          |  4 +-
+ .../families/deepseek_v41_metal/forward.zig   | 44 ++++++++++++++++++-
+ zig/tests/dsv41_forward.zig                   | 16 ++++++-
+ 3 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/metal/deepseek/v41.metal b/zig/kernels/metal/deepseek/v41.metal
+index 350be278c..d3112d636 100644
+--- a/zig/kernels/metal/deepseek/v41.metal
++++ b/zig/kernels/metal/deepseek/v41.metal
+@@ -362,8 +362,8 @@ template <typename XT, typename YT>
+ [[kernel]] void ds_gemv(const device XT* X [[buffer(0)]], const device bfloat* W [[buffer(1)]],
+                         device YT* Y [[buffer(2)]], constant GemvArgs& a [[buffer(3)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+-                        uint sg [[simdgroup_index_in_threadgroup]]) {
+-  const int j = int(tg.x) * 8 + int(sg);
++                        uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
++  const int j = int(tg.x) * int(nsg) + int(sg);
+   if (j >= a.n) return;
+   const int r0 = int(tg.y) * 8;
+   const int nr = min(8, a.rows - r0);
+diff --git a/zig/src/families/deepseek_v41_metal/forward.zig b/zig/src/families/deepseek_v41_metal/forward.zig
+index bb738edcd..4a8e03ec8 100644
+--- a/zig/src/families/deepseek_v41_metal/forward.zig
++++ b/zig/src/families/deepseek_v41_metal/forward.zig
+@@ -86,6 +86,19 @@ fn labelled(comptime f: []const u8, a: anytype) []const u8 {
+ }
+ var current: []const u8 = "";
+ var label: [64]u8 = undefined;
++/// Simdgroups a threadgroup of ds_gemv (a column each): the same sums at any count; more threadgroups spread the
++/// weights' reads over more of the GPU.
++pub var gemv_sgs: usize = 8;
++/// Layers a call encodes before committing them, so the GPU runs them while the host encodes the rest (0: one
++/// command buffer).
++pub var early_commit: usize = 2;
++var early_event: ?mtl.Event = null;
++var early_value: u64 = 0;
++/// A check's sum of the calls' GPU spans (seconds), first command buffer's start to the last's end, when set.
++pub var span: ?*f64 = null;
++var first: ?mtl.CommandBuffer = null;
++/// A check's wait for the call: poll the command buffer instead of sleeping in waitUntilCompleted.
++pub var spin_wait = false;
+ 
+ /// A check's GPU time by dispatch group: each barrier ends the encoder and opens the next one (serial, timestamped at
+ /// its start and end, fenced after the one before), so every group between two barriers gets its own GPU time.
+@@ -430,7 +443,7 @@ pub const Enc = struct {
+         self.tensor(w, 1);
+         self.buf(y, y_off, 2);
+         self.args(GemvArgs{ .rows = @intCast(rows), .n = @intCast(n), .k = @intCast(k), .group_n = @intCast(group_n), .x_stride = @intCast(x_stride), .y_stride = @intCast(n) }, 3);
+-        self.groups(.{ (n + 7) / 8, (rows + 7) / 8, 1 }, .{ 256, 1, 1 });
++        self.groups(.{ (n + gemv_sgs - 1) / gemv_sgs, (rows + 7) / 8, 1 }, .{ 32 * gemv_sgs, 1, 1 });
+     }
+ 
+     /// The call's RoPE table (s.trig) for rotations at `positions` = s.pos by `freq`, at this view's rows; null when
+@@ -748,7 +761,23 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+             x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+         };
+         note("\n=== layer {d}", .{i});
++        if (i == 0) first = null;
+         try layer.block(x, i, l);
++        // the first layers run while the host encodes the rest (a GPU event orders the two command buffers)
++        if (i + 1 == early_commit and dump == null and profile == null and lat == null) {
++            const ev = early_event orelse blk: {
++                early_event = try m.device.event();
++                break :blk early_event.?;
++            };
++            early_value += 1;
++            e.end();
++            cb.signalEvent(ev, early_value);
++            if (span != null) first = cb.retain();
++            cb.commit();
++            cb = m.queue.commandBufferUnretained();
++            cb.waitForEvent(ev, early_value);
++            e = cb.compute(kind());
++        }
+         if (dump) |d| { // the streams after each block: the buffers are untracked, so each block completes first
+             x.flush();
+             e.end();
+@@ -781,7 +810,20 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+         _ = std.c.clock_gettime(.MONOTONIC, &a1);
+         if (profile) |p| p[11] += secs(a0, a1);
+     };
++    if (spin_wait) {
++        // a check: poll instead of sleeping in waitUntilCompleted (the wake-up's latency, against a busy core)
++        while (true) switch (cb.status()) {
++            .completed, .@"error" => break,
++            else => std.atomic.spinLoopHint(),
++        };
++    }
+     cb.wait();
++    if (span) |sp| {
++        const start = if (first) |f| f.gpuStart() else cb.gpuStart();
++        sp.* += cb.gpuEnd() - start;
++    }
++    if (first) |f| f.release();
++    first = null;
+     if (profile) |p| p[9] += cb.gpuSeconds();
+     if (timing) |t| {
+         var t_end: std.c.timespec = undefined;
+diff --git a/zig/tests/dsv41_forward.zig b/zig/tests/dsv41_forward.zig
+index e0d47ae1c..a360dce1b 100644
+--- a/zig/tests/dsv41_forward.zig
++++ b/zig/tests/dsv41_forward.zig
+@@ -262,6 +262,8 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+     defer gpa.free(plain);
+     var baseline: f64 = 0;
+     const reps = 48;
++    const early0 = q.forward.early_commit;
++    defer q.forward.early_commit = early0;
+     for (keys.items) |key| {
+         if (std.mem.eql(u8, key, "trace")) {
+             cache.len = base;
+@@ -295,12 +297,20 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+         q.forward.nobar_before = if (std.mem.startsWith(u8, key, "nb:")) key[3..] else null;
+         const exp = std.mem.startsWith(u8, key, "exp:");
+         q.forward.override = if (exp) try overrideOf(gpa, io, m, key[4..]) else null;
+-        q.forward.skip = if (key.len == 0 or exp or q.forward.no_barriers or q.forward.serial or q.forward.nobar_before != null) null else key;
++        const gsg = std.mem.startsWith(u8, key, "gsg:");
++        q.forward.gemv_sgs = if (gsg) try std.fmt.parseInt(usize, key[4..], 10) else 8;
++        const ec = std.mem.startsWith(u8, key, "ec:");
++        q.forward.early_commit = if (ec) try std.fmt.parseInt(usize, key[3..], 10) else early0;
++        q.forward.spin_wait = std.mem.eql(u8, key, "spin");
++        q.forward.skip = if (key.len == 0 or exp or gsg or ec or q.forward.spin_wait or q.forward.no_barriers or q.forward.serial or q.forward.nobar_before != null) null else key;
+         for (0..4) |_| {
+             cache.len = base;
+             try q.forward.run(m, &scratch, &cache, &.{token}, .last, null);
+         }
+         q.forward.counted = .{ 0, 0 };
++        var span: f64 = 0;
++        q.forward.span = &span;
++        defer q.forward.span = null;
+         var best: f64 = std.math.inf(f64);
+         var sum: f64 = 0;
+         for (0..reps) |_| {
+@@ -333,13 +343,15 @@ fn sweep(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u3
+         const equal = std.mem.eql(u16, plain, row);
+         const mean = sum * 1e3 / reps;
+         if (key.len == 0) baseline = mean;
+-        std.debug.print("sweep {s:<24} {d:7.2} ms mean {d:7.2} best  saves {d:6.2}  dispatches {d} barriers {d}  logits {s}\n", .{ if (key.len == 0) "(none)" else key, mean, best * 1e3, baseline - mean, q.forward.counted[0] / reps, q.forward.counted[1] / reps, if (equal) "equal" else "differ" });
++        std.debug.print("sweep {s:<24} {d:7.2} ms mean {d:7.2} best  saves {d:6.2}  dispatches {d} barriers {d}  logits {s}  gpu {d:.2} ms, host {d:.2} ms\n", .{ if (key.len == 0) "(none)" else key, mean, best * 1e3, baseline - mean, q.forward.counted[0] / reps, q.forward.counted[1] / reps, if (equal) "equal" else "differ", span * 1e3 / reps, mean - span * 1e3 / reps });
+     }
+     q.forward.no_barriers = false;
+     q.forward.serial = false;
+     q.forward.skip = null;
+     q.forward.nobar_before = null;
+     q.forward.override = null;
++    q.forward.gemv_sgs = 8;
++    q.forward.spin_wait = false;
+ }
+ 
+ var exp_lib: ?mtl.Library = null;
+-- 
+2.54.0 (Apple Git-157)
+

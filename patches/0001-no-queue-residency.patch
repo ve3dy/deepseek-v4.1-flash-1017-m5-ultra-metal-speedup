@@ -1,0 +1,116 @@
+From f3d8e5e4b171d4f4de0e73c5e362d83d6299104a Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:43:53 +0700
+Subject: [PATCH] deepseek_v41: unretained command buffers; weights' residency
+ set off the queue by default
+
+Attached to the queue, the kernel counted the ~215 GB of weights once for the set
+and again for every command: requiredBytes ~434 GB > the 246 GB wired limit, so each
+command faulted (required > max) and the kernel unwired and re-wired ~220 GB around
+every request. Guarded test on an M5 Ultra: 45 faults per request before, 47 with
+unretained buffers alone, 0 with the set off the queue. TF_QUEUE_RESIDENCY=1 restores
+the old behaviour.
+---
+ zig/src/families/deepseek_v41_metal/draft.zig   |  2 +-
+ zig/src/families/deepseek_v41_metal/forward.zig |  6 +++---
+ zig/src/families/deepseek_v41_metal/model.zig   | 11 +++++++++--
+ zig/src/families/deepseek_v41_metal/vision.zig  |  3 ++-
+ 4 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/deepseek_v41_metal/draft.zig b/zig/src/families/deepseek_v41_metal/draft.zig
+index c7b586456..4f3ef71fe 100644
+--- a/zig/src/families/deepseek_v41_metal/draft.zig
++++ b/zig/src/families/deepseek_v41_metal/draft.zig
+@@ -41,7 +41,7 @@ pub fn draft(m: *Model, ds: *st.Scratch, cache: *st.Cache, token: u32, at: usize
+     ds.draft_ids.slice(u32, n + 1)[0] = token;
+     @memset(ds.img.slice(i32, n), 0); // drafts are text
+ 
+-    var cb = m.queue.commandBuffer();
++    var cb = m.queue.commandBufferUnretained(); // binds only model and scratch buffers; cb.wait() below
+     var e = cb.compute(.concurrent);
+     fwd.pending_expand = false;
+     fwd.pending_topk = 0;
+diff --git a/zig/src/families/deepseek_v41_metal/forward.zig b/zig/src/families/deepseek_v41_metal/forward.zig
+index 145f66e99..272eeb501 100644
+--- a/zig/src/families/deepseek_v41_metal/forward.zig
++++ b/zig/src/families/deepseek_v41_metal/forward.zig
+@@ -119,7 +119,7 @@ pub const Enc = struct {
+         self.cbp.*.wait();
+         if (self.cbp.*.status() != .completed) return error.DeepseekGpuFailed;
+         p[section] += self.cbp.*.gpuSeconds();
+-        self.cbp.* = self.m.queue.commandBuffer();
++        self.cbp.* = self.m.queue.commandBufferUnretained();
+         self.ep.* = self.cbp.*.compute(.concurrent);
+     }
+ 
+@@ -510,7 +510,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+ 
+     var t_start: std.c.timespec = undefined;
+     _ = std.c.clock_gettime(.MONOTONIC, &t_start);
+-    var cb = m.queue.commandBuffer();
++    var cb = m.queue.commandBufferUnretained(); // every buffer it binds is the model's or the scratch's; cb.wait() below
+     const w = &m.weights;
+     var e = cb.compute(.concurrent);
+     pending_expand = false;
+@@ -553,7 +553,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
+             cb.wait();
+             if (cb.status() != .completed) return error.DeepseekGpuFailed;
+             @memcpy(d.layers[i].contents()[0 .. rows * c.hc * c.hidden * 2], s.x.contents()[0 .. rows * c.hc * c.hidden * 2]);
+-            cb = m.queue.commandBuffer();
++            cb = m.queue.commandBufferUnretained();
+             e = cb.compute(.concurrent);
+         }
+     }
+diff --git a/zig/src/families/deepseek_v41_metal/model.zig b/zig/src/families/deepseek_v41_metal/model.zig
+index e76c939ed..19d38b3a0 100644
+--- a/zig/src/families/deepseek_v41_metal/model.zig
++++ b/zig/src/families/deepseek_v41_metal/model.zig
+@@ -67,7 +67,10 @@ pub const Model = struct {
+         m.freq_compressed = try m.device.buffer(32 * 4, opts);
+         frequencies(m.config.rope, false, m.freq_plain.slice(f32, 32));
+         frequencies(m.config.rope, true, m.freq_compressed.slice(f32, 32));
+-        if (m.resident) |set| m.queue.addResidencySet(set);
++        // The set stays requested (requestResidency above) but off the queue by default: attached to the queue, the
++        // kernel counted the weights once for it and again per command (~434 GB "required > max" against a 246 GB
++        // limit, unwiring ~220 GB per request; Mac Studio black screens 2026-10-26). TF_QUEUE_RESIDENCY=1 restores it.
++        if (m.resident) |set| if (queueResidency()) m.queue.addResidencySet(set);
+         return m;
+     }
+ 
+@@ -78,7 +81,7 @@ pub const Model = struct {
+ 
+     pub fn deinit(m: *Model) void {
+         if (m.resident) |set| {
+-            m.queue.removeResidencySet(set);
++            if (queueResidency()) m.queue.removeResidencySet(set);
+             set.deinit();
+         }
+         m.freq_plain.deinit();
+@@ -92,6 +95,10 @@ pub const Model = struct {
+     }
+ };
+ 
++fn queueResidency() bool {
++    return std.c.getenv("TF_QUEUE_RESIDENCY") != null;
++}
++
+ /// precompute_freqs_cis's 64-dim frequencies 1 / theta^(2i/64), with YaRN's ramp when `compressed`.
+ pub fn frequencies(r: cfg.Rope, compressed: bool, out: []f32) void {
+     const dim: f64 = cfg.rope_dim;
+diff --git a/zig/src/families/deepseek_v41_metal/vision.zig b/zig/src/families/deepseek_v41_metal/vision.zig
+index 30ead6b7f..d6d6267bd 100644
+--- a/zig/src/families/deepseek_v41_metal/vision.zig
++++ b/zig/src/families/deepseek_v41_metal/vision.zig
+@@ -137,7 +137,8 @@ pub fn run(m: *Model, v: *const Weights, pixels: mtl.Buffer, n_h: u32, n_w: u32,
+ 
+     const pool = mtl.objc.Pool.push();
+     defer pool.pop();
+-    const cb = m.queue.commandBuffer();
++    // unretained: the transient buffers above are freed by their defers, which run only after cb.wait() below
++    const cb = m.queue.commandBufferUnretained();
+     const e = cb.compute(.serial);
+     const k = &m.kernels;
+     const lin = struct {
+-- 
+2.54.0 (Apple Git-157)
+

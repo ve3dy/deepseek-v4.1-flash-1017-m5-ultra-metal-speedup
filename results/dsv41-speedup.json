@@ -1,0 +1,51 @@
+{
+  "machine": "Mac Studio M5 Ultra (30-core CPU, 64-core GPU, 256 GB)",
+  "checkpoint": "DeepSeek-V4.1-Flash-1017 e2e3-p4-h8 + iQ GPTQ + heretic",
+  "engines": {
+    "reference": "TensorFold f3d8e5e4 (72a552ed + residency patch)",
+    "served_run": "TensorFold 58ef703f",
+    "deployed": "TensorFold a424d0fe (58ef703f's kernels + a failure check)"
+  },
+  "served_tok_s": {
+    "prose": {
+      "reference": 61.8,
+      "58ef703f": 66.3
+    },
+    "code": {
+      "reference": 90.8,
+      "58ef703f": 91.3
+    },
+    "json": {
+      "reference": 110.9,
+      "58ef703f": 114.8
+    },
+    "list": {
+      "reference": 108.0,
+      "58ef703f": 108.5
+    },
+    "4 streams": {
+      "reference": 112.7,
+      "58ef703f": 115.7
+    }
+  },
+  "served_runs": {
+    "reference": "2026-10-27, macOS 27.0.1",
+    "58ef703f": "2026-10-28, macOS 27.2"
+  },
+  "decode_row_ms": {
+    "reference\nf3d8e5e4": 15.62,
+    "RoPE table,\nmerge loads,\nrouting": 15.15,
+    "first layers\ncommitted early": 14.73,
+    "indexer steps\nside by side": 14.57
+  },
+  "bounds_ms": {
+    "this engine": 14.57,
+    "no waits between GPU steps*": 8.35
+  },
+  "exactness": [
+    "decode row logits: byte-identical",
+    "128 greedy tokens, plain and drafted: identical",
+    "4 streams together vs alone: 108/108 rows, 32/32 drafts",
+    "MMLU-Pro 79.7 / GSM8K 97 / HumanEval 93.9 carry over"
+  ]
+}

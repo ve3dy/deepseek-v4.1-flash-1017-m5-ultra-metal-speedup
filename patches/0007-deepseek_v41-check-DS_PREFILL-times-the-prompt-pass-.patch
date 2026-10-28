@@ -1,0 +1,55 @@
+From 304f11366194cc78fd36d6ec98c969f9f677b65c Mon Sep 17 00:00:00 2001
+From: ve3dy <107175659+ve3dy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:40:09 +0700
+Subject: [PATCH] deepseek_v41 check: DS_PREFILL times the prompt pass in
+ 1,024-row chunks as the server runs it
+
+---
+ zig/tests/dsv41_forward.zig | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/zig/tests/dsv41_forward.zig b/zig/tests/dsv41_forward.zig
+index a360dce1b..72168ae4c 100644
+--- a/zig/tests/dsv41_forward.zig
++++ b/zig/tests/dsv41_forward.zig
+@@ -28,6 +28,7 @@ pub fn main(init: std.process.Init) !void {
+     if (std.c.getenv("DS_INDEX_ROWS") != null) q.forward.index_nax = false;
+     if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d), if (args.len == 5) chunk else 256);
+     if (std.c.getenv("DS_SWEEP") != null) return sweep(gpa, init.io, args[1], ids);
++    if (std.c.getenv("DS_PREFILL") != null) return prefill(gpa, init.io, args[1], ids);
+     var t0: std.c.timespec = undefined;
+     _ = std.c.clock_gettime(.MONOTONIC, &t0);
+     const m = try q.Model.load(gpa, init.io, args[1], false);
+@@ -673,3 +674,29 @@ fn shared(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
+     std.debug.print("shared {d} rounds of {d} streams: logits equal for {d}/{d} rows, drafts equal {d}/{d}; {d:.1} ms a round shared, {d:.1} ms alone\n", .{ rounds, k, rows_same, rows_all, drafts_same, rounds * k, times[0] * 1e3 / @as(f64, @floatFromInt(rounds)), times[1] * 1e3 / @as(f64, @floatFromInt(rounds)) });
+     if (rows_same != rows_all or drafts_same != rounds * k) return error.SharedForwardDiffers;
+ }
++
++/// DS_PREFILL: the prompt through the forward in 1,024-row chunks as the server's prompt pass runs them (each next
++/// chunk's engram rows gathered while this one runs), twice into a fresh cache: tok/s of the second pass.
++fn prefill(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32) !void {
++    const m = try q.Model.load(gpa, io, dir, false);
++    defer m.deinit();
++    var scratch = try q.state.Scratch.init(gpa, m.device, 1024);
++    defer scratch.deinit();
++    for (0..2) |pass| {
++        var cache = try q.state.Cache.init(gpa, m.device, ids.len + 64);
++        defer cache.deinit();
++        var t0: std.c.timespec = undefined;
++        var t1: std.c.timespec = undefined;
++        _ = std.c.clock_gettime(.MONOTONIC, &t0);
++        var at: usize = 0;
++        while (at < ids.len) {
++            const n = @min(1024, ids.len - at);
++            const after = @min(1024, ids.len - at - n);
++            try q.forward.runChunk(m, &scratch, &cache, ids[at..][0..n], .last, null, if (after > 0) .{ .tokens = ids[at + n ..][0..after] } else null);
++            at += n;
++        }
++        _ = std.c.clock_gettime(.MONOTONIC, &t1);
++        const s = seconds(t0, t1);
++        std.debug.print("prefill pass {d}: {d} tokens in {d:.3} s, {d:.0} tok/s\n", .{ pass, ids.len, s, @as(f64, @floatFromInt(ids.len)) / s });
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
